@@ -10,3 +10,9 @@ type Trade struct {
 	QuantidadeNegociada int64     `json:"quantidade_negociada,omitempty"`
 	HoraFechamento      string    `json:"hora_fechamento,omitempty"`
 }
+
+// TradeResult wraps a Trade with its source file path.
+type TradeResult struct {
+	Trade    *Trade
+	FilePath string
+}

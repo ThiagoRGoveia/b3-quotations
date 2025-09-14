@@ -38,10 +38,10 @@ func CreateFileRecordTable(dbpool *pgxpool.Pool) error {
 	return nil
 }
 
-// CreateTradeLoadRecordTable creates the trade_load_records table in the database.
+// CreateTradeLoadRecordTable creates the trade_loaded_records table in the database.
 func CreateTradeLoadRecordTable(dbpool *pgxpool.Pool) error {
 	query := `
-	CREATE TABLE IF NOT EXISTS trade_load_records (
+	CREATE TABLE IF NOT EXISTS trade_loaded_records (
 		id SERIAL PRIMARY KEY,
 		data_negocio TIMESTAMP,
 		codigo_instrumento VARCHAR(255),
@@ -55,7 +55,7 @@ func CreateTradeLoadRecordTable(dbpool *pgxpool.Pool) error {
 
 	_, err := dbpool.Exec(context.Background(), query)
 	if err != nil {
-		return fmt.Errorf("error creating trade_load_records table: %v", err)
+		return fmt.Errorf("error creating trade_loaded_records table: %v", err)
 	}
 
 	return nil
@@ -77,10 +77,10 @@ func InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, sta
 	return fileID, nil
 }
 
-// InsertTrade inserts a new trade record into the trade_load_records table.
+// InsertTrade inserts a new trade record into the trade_loaded_records table.
 func InsertTrade(dbpool *pgxpool.Pool, trade *Trade, fileID int, isValid bool) (int, error) {
 	query := `
-	INSERT INTO trade_load_records (data_negocio, codigo_instrumento, preco_negocio, quantidade_negociada, hora_fechamento, is_valid, file_id)
+	INSERT INTO trade_loaded_records (data_negocio, codigo_instrumento, preco_negocio, quantidade_negociada, hora_fechamento, is_valid, file_id)
 	VALUES ($1, $2, $3, $4, $5, $6, $7)
 	RETURNING id;`
 
@@ -91,4 +91,19 @@ func InsertTrade(dbpool *pgxpool.Pool, trade *Trade, fileID int, isValid bool) (
 	}
 
 	return tradeID, nil
+}
+
+// UpdateFileStatus updates the status of a file record in the database.
+func UpdateFileStatus(dbpool *pgxpool.Pool, fileID int, status string) error {
+	query := `
+	UPDATE file_records
+	SET status = $1
+	WHERE id = $2;`
+
+	_, err := dbpool.Exec(context.Background(), query, status, fileID)
+	if err != nil {
+		return fmt.Errorf("error updating file status: %v", err)
+	}
+
+	return nil
 }

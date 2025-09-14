@@ -1,22 +1,23 @@
 package main
 
 import (
-	"fmt"
 	"log"
-
-	// "os"
-	// "path/filepath"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
 	numWorkers = 4
-	// filesPath     = "files"
+	filesPath  = "files"
 )
 
 func main() {
 	jobs := make(chan string, 100)
-	results := make(chan *Trade, 100)
+	results := make(chan *TradeResult, 100)
 
 	var wg sync.WaitGroup
 
@@ -26,40 +27,68 @@ func main() {
 		go Worker(w, &wg, jobs, results)
 	}
 
-	// Send the specific file to the jobs channel
+	// Scan directory and send jobs
 	go func() {
-		// filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
-		// 	if err != nil {
-		// 		return err
-		// 	}
-		// 	if !info.IsDir() {
-		// 		jobs <- path
-		// 	}
-		// 	return nil
-		// })
-		jobs <- "files/sample.txt"
-		close(jobs)
+		defer close(jobs)
+		err := filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				jobs <- path
+			}
+			return nil
+		})
+		if err != nil {
+			log.Printf("Error walking the path %s: %v", filesPath, err)
+		}
 	}()
 
-	// Wait for all jobs to be processed
+	// Wait for all parsing jobs to be processed, then close the results channel
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// TESTING Collect results
-	var allTrades []*Trade
-	for r := range results {
-		allTrades = append(allTrades, r)
+	// Setup Database Connection
+	dbpool, err := ConnectDB()
+	if err != nil {
+		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
+	defer dbpool.Close()
 
-	log.Printf("Processed %d trades", len(allTrades))
+	// Process results
+	processResults(results, dbpool)
+}
 
-	// Print some trades to verify
-	for i, trade := range allTrades {
-		if i > 10 {
-			break
+func processResults(results <-chan *TradeResult, dbpool *pgxpool.Pool) {
+	fileRecords := make(map[string]int)
+
+	for result := range results {
+		fileID, exists := fileRecords[result.FilePath]
+		if !exists {
+			var err error
+			fileID, err = InsertFileRecord(dbpool, result.FilePath, time.Now(), "PROCESSING")
+			if err != nil {
+				log.Printf("Error inserting file record for %s: %v\n", result.FilePath, err)
+				continue // Skip this trade if we can't create a file record
+			}
+			fileRecords[result.FilePath] = fileID
 		}
-		fmt.Printf("%+v\n", trade)
+
+		_, err := InsertTrade(dbpool, result.Trade, fileID, false) // is_valid is false as requested
+		if err != nil {
+			log.Printf("Error inserting trade for file %s: %v\n", result.FilePath, err)
+		}
 	}
+
+	// Update status for all processed files
+	for path, id := range fileRecords {
+		err := UpdateFileStatus(dbpool, id, "DONE")
+		if err != nil {
+			log.Printf("Error updating file status to DONE for %s: %v\n", path, err)
+		}
+	}
+
+	log.Println("Finished processing and saving all trades.")
 }

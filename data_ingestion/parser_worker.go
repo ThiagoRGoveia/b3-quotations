@@ -6,7 +6,7 @@ import (
 )
 
 // Worker reads file paths from a channel, parses the files, and sends the results to another channel.
-func Worker(id int, wg *sync.WaitGroup, jobs <-chan string, results chan<- *Trade) {
+func Worker(id int, wg *sync.WaitGroup, jobs <-chan string, results chan<- *TradeResult) {
 	defer wg.Done()
 	for job := range jobs {
 		fmt.Printf("Worker %d started job %s\n", id, job)

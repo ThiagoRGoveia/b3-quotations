@@ -38,7 +38,7 @@ func parseRecord(record []string) (*Trade, error) {
 }
 
 // ParseCSV reads a CSV file from the given path and streams parsed records into a channel.
-func ParseCSV(filePath string, tradesChan chan<- *Trade) error {
+func ParseCSV(filePath string, tradesChan chan<- *TradeResult) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -73,7 +73,7 @@ func ParseCSV(filePath string, tradesChan chan<- *Trade) error {
 			continue
 		}
 
-		tradesChan <- trade
+		tradesChan <- &TradeResult{Trade: trade, FilePath: filePath}
 	}
 
 	return nil
