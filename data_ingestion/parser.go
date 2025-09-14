@@ -59,12 +59,18 @@ func ParseCSV(filePath string, tradesChan chan<- *Trade) error {
 			break
 		}
 		if err != nil {
-			continue // Skip corrupted records
+			continue // Skip corrupted records // add this error to log later
 		}
 
 		trade, err := parseRecord(record)
 		if err != nil {
 			continue // Skip records that can't be parsed // add this error to log later
+		}
+
+		// Validate the record
+		if err := validateRecord(record); err != nil {
+			// Consider logging this validation error
+			continue
 		}
 
 		tradesChan <- trade
