@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/db"
+	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/workers"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -17,14 +20,14 @@ const (
 
 func main() {
 	jobs := make(chan string, 100)
-	results := make(chan *TradeResult, 100)
+	results := make(chan *models.TradeResult, 100)
 
 	var wg sync.WaitGroup
 
 	// Start workers
 	for w := 1; w <= numWorkers; w++ {
 		wg.Add(1)
-		go Worker(w, &wg, jobs, results)
+		go workers.ParserWorker(w, &wg, jobs, results)
 	}
 
 	// Scan directory and send jobs
@@ -51,7 +54,7 @@ func main() {
 	}()
 
 	// Setup Database Connection
-	dbpool, err := ConnectDB()
+	dbpool, err := db.ConnectDB()
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
@@ -61,14 +64,14 @@ func main() {
 	processResults(results, dbpool)
 }
 
-func processResults(results <-chan *TradeResult, dbpool *pgxpool.Pool) {
+func processResults(results <-chan *models.TradeResult, dbpool *pgxpool.Pool) {
 	fileRecords := make(map[string]int)
 
 	for result := range results {
 		fileID, exists := fileRecords[result.FilePath]
 		if !exists {
 			var err error
-			fileID, err = InsertFileRecord(dbpool, result.FilePath, time.Now(), "PROCESSING")
+			fileID, err = db.InsertFileRecord(dbpool, result.FilePath, time.Now(), "PROCESSING")
 			if err != nil {
 				log.Printf("Error inserting file record for %s: %v\n", result.FilePath, err)
 				continue // Skip this trade if we can't create a file record
@@ -76,7 +79,7 @@ func processResults(results <-chan *TradeResult, dbpool *pgxpool.Pool) {
 			fileRecords[result.FilePath] = fileID
 		}
 
-		_, err := InsertTrade(dbpool, result.Trade, fileID, false) // is_valid is false as requested
+		_, err := db.InsertTrade(dbpool, result.Trade, fileID, false) // is_valid is false as requested
 		if err != nil {
 			log.Printf("Error inserting trade for file %s: %v\n", result.FilePath, err)
 		}
@@ -84,7 +87,7 @@ func processResults(results <-chan *TradeResult, dbpool *pgxpool.Pool) {
 
 	// Update status for all processed files
 	for path, id := range fileRecords {
-		err := UpdateFileStatus(dbpool, id, "DONE")
+		err := db.UpdateFileStatus(dbpool, id, "DONE")
 		if err != nil {
 			log.Printf("Error updating file status to DONE for %s: %v\n", path, err)
 		}

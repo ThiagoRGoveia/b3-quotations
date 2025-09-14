@@ -1,24 +1,13 @@
-package main
+package db
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
+	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// ConnectDB establishes a connection to the PostgreSQL database.
-func ConnectDB() (*pgxpool.Pool, error) {
-	connStr := os.Getenv("DATABASE_URL")
-	dbpool, err := pgxpool.New(context.Background(), connStr)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect to database: %v", err)
-	}
-
-	return dbpool, nil
-}
 
 // CreateFileRecordTable creates the file_records table in the database.
 func CreateFileRecordTable(dbpool *pgxpool.Pool) error {
@@ -78,7 +67,7 @@ func InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, sta
 }
 
 // InsertTrade inserts a new trade record into the trade_loaded_records table.
-func InsertTrade(dbpool *pgxpool.Pool, trade *Trade, fileID int, isValid bool) (int, error) {
+func InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, fileID int, isValid bool) (int, error) {
 	query := `
 	INSERT INTO trade_loaded_records (data_negocio, codigo_instrumento, preco_negocio, quantidade_negociada, hora_fechamento, is_valid, file_id)
 	VALUES ($1, $2, $3, $4, $5, $6, $7)

@@ -1,4 +1,4 @@
-package main
+package validators
 
 import (
 	"fmt"
@@ -13,8 +13,8 @@ var requiredFields = map[int]string{
 	8: "DataNegocio",
 }
 
-// validateRecord checks if all required fields in a CSV record are non-empty.
-func validateRecord(record []string) error {
+// ValidateRecord checks if all required fields in a CSV record are non-empty.
+func ValidateRecord(record []string) error {
 	for index, name := range requiredFields {
 		if index >= len(record) || record[index] == "" {
 			return fmt.Errorf("validation failed: field %s is null or empty", name)

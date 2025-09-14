@@ -1,4 +1,4 @@
-package main
+package models
 
 import "time"
 
@@ -12,7 +12,3 @@ type Trade struct {
 }
 
 // TradeResult wraps a Trade with its source file path.
-type TradeResult struct {
-	Trade    *Trade
-	FilePath string
-}

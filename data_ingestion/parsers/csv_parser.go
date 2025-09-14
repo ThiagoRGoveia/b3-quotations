@@ -1,4 +1,4 @@
-package main
+package parsers
 
 import (
 	"encoding/csv"
@@ -7,10 +7,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/validators"
 )
 
 // parseRecord parses a single CSV record into a Trade struct.
-func parseRecord(record []string) (*Trade, error) {
+func parseRecord(record []string) (*models.Trade, error) {
 	// DataReferencia;CodigoInstrumento;AcaoAtualizacao;PrecoNegocio;QuantidadeNegociada;HoraFechamento;CodigoIdentificadorNegocio;TipoSessaoPregao;DataNegocio;CodigoParticipanteComprador;CodigoParticipanteVendedor
 	precoNegocioStr := strings.Replace(record[3], ",", ".", 1)
 	precoNegocio, err := strconv.ParseFloat(precoNegocioStr, 64)
@@ -28,7 +31,7 @@ func parseRecord(record []string) (*Trade, error) {
 		return nil, err
 	}
 
-	return &Trade{
+	return &models.Trade{
 		CodigoInstrumento:   record[1],
 		PrecoNegocio:        precoNegocio,
 		QuantidadeNegociada: quantidadeNegociada,
@@ -38,7 +41,7 @@ func parseRecord(record []string) (*Trade, error) {
 }
 
 // ParseCSV reads a CSV file from the given path and streams parsed records into a channel.
-func ParseCSV(filePath string, tradesChan chan<- *TradeResult) error {
+func ParseCSV(filePath string, tradesChan chan<- *models.TradeResult) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -68,12 +71,12 @@ func ParseCSV(filePath string, tradesChan chan<- *TradeResult) error {
 		}
 
 		// Validate the record
-		if err := validateRecord(record); err != nil {
+		if err := validators.ValidateRecord(record); err != nil {
 			// Consider logging this validation error
 			continue
 		}
 
-		tradesChan <- &TradeResult{Trade: trade, FilePath: filePath}
+		tradesChan <- &models.TradeResult{Trade: trade, FilePath: filePath}
 	}
 
 	return nil
