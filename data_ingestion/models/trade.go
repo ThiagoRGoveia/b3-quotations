@@ -11,5 +11,3 @@ type Trade struct {
 	HoraFechamento      string    `json:"hora_fechamento,omitempty"`
 	FileID              int       `json:"file_id,omitempty"`
 }
-
-// TradeResult wraps a Trade with its source file path.

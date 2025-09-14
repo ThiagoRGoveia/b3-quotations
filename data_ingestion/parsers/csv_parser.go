@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/validators"
 )
 
 // parseRecord parses a single CSV record into a Trade struct.
@@ -69,12 +68,6 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade) error {
 		trade, err := parseRecord(record, fileID)
 		if err != nil {
 			continue // Skip records that can't be parsed // add this error to log later
-		}
-
-		// Validate the record
-		if err := validators.ValidateRecord(record); err != nil {
-			// Consider logging this validation error
-			continue
 		}
 
 		results <- trade
