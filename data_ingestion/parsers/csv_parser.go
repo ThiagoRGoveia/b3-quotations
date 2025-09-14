@@ -13,7 +13,7 @@ import (
 )
 
 // parseRecord parses a single CSV record into a Trade struct.
-func parseRecord(record []string) (*models.Trade, error) {
+func parseRecord(record []string, fileID int) (*models.Trade, error) {
 	// DataReferencia;CodigoInstrumento;AcaoAtualizacao;PrecoNegocio;QuantidadeNegociada;HoraFechamento;CodigoIdentificadorNegocio;TipoSessaoPregao;DataNegocio;CodigoParticipanteComprador;CodigoParticipanteVendedor
 	precoNegocioStr := strings.Replace(record[3], ",", ".", 1)
 	precoNegocio, err := strconv.ParseFloat(precoNegocioStr, 64)
@@ -32,6 +32,7 @@ func parseRecord(record []string) (*models.Trade, error) {
 	}
 
 	return &models.Trade{
+		FileID:              fileID,
 		CodigoInstrumento:   record[1],
 		PrecoNegocio:        precoNegocio,
 		QuantidadeNegociada: quantidadeNegociada,
@@ -41,7 +42,7 @@ func parseRecord(record []string) (*models.Trade, error) {
 }
 
 // ParseCSV reads a CSV file from the given path and streams parsed records into a channel.
-func ParseCSV(filePath string, tradesChan chan<- *models.TradeResult) error {
+func ParseCSV(filePath string, fileID int, results chan<- *models.Trade) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -65,7 +66,7 @@ func ParseCSV(filePath string, tradesChan chan<- *models.TradeResult) error {
 			continue // Skip corrupted records // add this error to log later
 		}
 
-		trade, err := parseRecord(record)
+		trade, err := parseRecord(record, fileID)
 		if err != nil {
 			continue // Skip records that can't be parsed // add this error to log later
 		}
@@ -76,7 +77,7 @@ func ParseCSV(filePath string, tradesChan chan<- *models.TradeResult) error {
 			continue
 		}
 
-		tradesChan <- &models.TradeResult{Trade: trade, FilePath: filePath}
+		results <- trade
 	}
 
 	return nil

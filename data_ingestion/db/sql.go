@@ -67,14 +67,14 @@ func InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, sta
 }
 
 // InsertTrade inserts a new trade record into the trade_loaded_records table.
-func InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, fileID int, isValid bool) (int, error) {
+func InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, isValid bool) (int, error) {
 	query := `
 	INSERT INTO trade_loaded_records (data_negocio, codigo_instrumento, preco_negocio, quantidade_negociada, hora_fechamento, is_valid, file_id)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	RETURNING id;`
 
 	var tradeID int
-	err := dbpool.QueryRow(context.Background(), query, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, fileID).Scan(&tradeID)
+	err := dbpool.QueryRow(context.Background(), query, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, trade.FileID).Scan(&tradeID)
 	if err != nil {
 		return 0, fmt.Errorf("error inserting trade: %v", err)
 	}

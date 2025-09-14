@@ -1,0 +1,3 @@
+package db
+
+const FILE_STATUS_PROCESSING = "PROCESSING"
