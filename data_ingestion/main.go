@@ -18,52 +18,6 @@ const (
 	filesPath  = "files"
 )
 
-func main() {
-	jobs := make(chan string, 100)
-	results := make(chan *models.TradeResult, 100)
-
-	var wg sync.WaitGroup
-
-	// Start workers
-	for w := 1; w <= numWorkers; w++ {
-		wg.Add(1)
-		go workers.ParserWorker(w, &wg, jobs, results)
-	}
-
-	// Scan directory and send jobs
-	go func() {
-		defer close(jobs)
-		err := filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				jobs <- path
-			}
-			return nil
-		})
-		if err != nil {
-			log.Printf("Error walking the path %s: %v", filesPath, err)
-		}
-	}()
-
-	// Wait for all parsing jobs to be processed, then close the results channel
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Setup Database Connection
-	dbpool, err := db.ConnectDB()
-	if err != nil {
-		log.Fatalf("Unable to connect to database: %v\n", err)
-	}
-	defer dbpool.Close()
-
-	// Process results
-	processResults(results, dbpool)
-}
-
 func processResults(results <-chan *models.TradeResult, dbpool *pgxpool.Pool) {
 	fileRecords := make(map[string]int)
 
@@ -94,4 +48,70 @@ func processResults(results <-chan *models.TradeResult, dbpool *pgxpool.Pool) {
 	}
 
 	log.Println("Finished processing and saving all trades.")
+}
+
+func setup() (*pgxpool.Pool, chan string, chan *models.TradeResult, *sync.WaitGroup) {
+	log.Println("Starting setup...")
+
+	dbpool, err := db.ConnectDB()
+	if err != nil {
+		log.Fatalf("Unable to connect to database: %v\n", err)
+	}
+
+	jobs := make(chan string, 100)
+	results := make(chan *models.TradeResult, 100)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go workers.ParserWorker(w, &wg, jobs, results)
+	}
+
+	log.Println("Setup complete.")
+	return dbpool, jobs, results, &wg
+}
+
+func execute(dbpool *pgxpool.Pool, jobs chan<- string, results chan *models.TradeResult, wg *sync.WaitGroup) {
+	log.Println("Executing process...")
+
+	// Goroutine to scan directory and send jobs
+	go func() {
+		defer close(jobs)
+		err := filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				jobs <- path
+			}
+			return nil
+		})
+		if err != nil {
+			log.Printf("Error walking the path %s: %v", filesPath, err)
+		}
+	}()
+
+	// Goroutine to wait for all parsing jobs to finish and then close the results channel
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process the results from the channel
+	processResults(results, dbpool)
+
+	log.Println("Execution complete.")
+}
+
+func teardown(dbpool *pgxpool.Pool) {
+	log.Println("Tearing down...")
+	dbpool.Close()
+	log.Println("Teardown complete.")
+}
+
+func main() {
+	dbpool, jobs, results, wg := setup()
+	execute(dbpool, jobs, results, wg)
+	teardown(dbpool)
 }
