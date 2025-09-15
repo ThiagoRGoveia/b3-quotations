@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"sync"
 
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/db"
@@ -11,10 +12,13 @@ import (
 
 const (
 	numParserWorkers = 4
-	filesPath        = "files"
 )
 
 func main() {
+	if len(os.Args) < 2 {
+		log.Fatal("Please provide the folder path as a command-line argument.")
+	}
+	filesPath := os.Args[1]
 	dbpool, err := db.ConnectDB()
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
