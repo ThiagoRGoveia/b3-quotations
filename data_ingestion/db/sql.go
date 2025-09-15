@@ -37,7 +37,7 @@ func (m *PostgresDBManager) CreateFileRecordTable() error {
 	return nil
 }
 
-// CreateTradeLoadRecordTable creates the trade_loaded_records table in the database.
+// CreateTradeLoadedRecordTable creates the trade_loaded_records table in the database.
 func (m *PostgresDBManager) CreateTradeLoadedRecordTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_loaded_records (
@@ -50,7 +50,8 @@ func (m *PostgresDBManager) CreateTradeLoadedRecordTable() error {
 		is_valid BOOLEAN,
 		file_id INTEGER,
 		FOREIGN KEY (file_id) REFERENCES file_records(id)
-	);`
+	);
+	`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
@@ -76,6 +77,14 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 		return fmt.Errorf("error creating trade_records table: %v", err)
 	}
 
+	query = `
+	CREATE INDEX idx_trade_records_covering ON trade_records (codigo_instrumento, data_negocio, preco_negocio, quantidade_negociada);`
+
+	_, err = m.dbpool.Exec(context.Background(), query)
+	if err != nil {
+		return fmt.Errorf("error creating index: %v", err)
+	}
+
 	return nil
 }
 
@@ -96,14 +105,14 @@ func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, st
 }
 
 // InsertTrade inserts a new trade record into the trade_loaded_records table.
-func (m *PostgresDBManager) InsertTrade(trade *models.Trade, isValid bool) (int, error) {
+func (m *PostgresDBManager) InsertTrade(trade *models.Trade) (int, error) {
 	query := `
 	INSERT INTO trade_loaded_records (data_negocio, codigo_instrumento, preco_negocio, quantidade_negociada, hora_fechamento, is_valid, file_id)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
 	RETURNING id;`
 
 	var tradeID int
-	err := m.dbpool.QueryRow(context.Background(), query, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, trade.FileID).Scan(&tradeID)
+	err := m.dbpool.QueryRow(context.Background(), query, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, trade.IsValid(), trade.FileID).Scan(&tradeID)
 	if err != nil {
 		return 0, fmt.Errorf("error inserting trade: %v", err)
 	}
@@ -129,43 +138,39 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors [
 
 func (m *PostgresDBManager) ValidateSavedData(fileIDs []int) error {
 	query := `
-	CREATE INDEX IF NOT EXISTS idx_trade_loaded_records_file_id
-	ON trade_loaded_records (file_id);`
-
-	_, err := m.dbpool.Exec(context.Background(), query)
-	if err != nil {
-		return fmt.Errorf("error creating index: %v", err)
-	}
-
-	query = `
 	UPDATE trade_loaded_records
-	SET is_valid = true
-	WHERE file_id = ANY($1) AND
-		is_valid = false AND
-		data_negocio IS NOT NULL AND 
-		codigo_instrumento IS NOT NULL AND 
-		preco_negocio IS NOT NULL AND 
-		quantidade_negociada IS NOT NULL AND 
-		hora_fechamento IS NOT NULL;`
+	SET is_valid = (
+		CASE
+			WHEN data_negocio IS NOT NULL AND
+				 codigo_instrumento IS NOT NULL AND
+				 preco_negocio IS NOT NULL AND
+				 quantidade_negociada IS NOT NULL AND
+				 hora_fechamento IS NOT NULL
+			THEN true
+			ELSE false
+		END
+	)
+	WHERE file_id = ANY($1);`
 
-	_, err = m.dbpool.Exec(context.Background(), query, fileIDs)
+	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
 		return fmt.Errorf("error validating saved data: %v", err)
 	}
-
-	query = `
-	DROP INDEX IF EXISTS idx_trade_loaded_records_file_id;`
-
-	_, err = m.dbpool.Exec(context.Background(), query)
-	if err != nil {
-		return fmt.Errorf("error dropping index: %v", err)
-	}
-
 	return nil
 }
 
 func (m *PostgresDBManager) TransferDataToFinalTable(fileIDs []int) error {
 	query := `
+	WITH valid_trades AS (
+		SELECT 
+			data_negocio, 
+			codigo_instrumento, 
+			preco_negocio, 
+			quantidade_negociada, 
+			hora_fechamento
+		FROM trade_loaded_records
+		WHERE file_id = ANY($1) AND is_valid = true
+	)
 	INSERT INTO trade_records (
 		data_negocio,
 		codigo_instrumento,
@@ -173,14 +178,7 @@ func (m *PostgresDBManager) TransferDataToFinalTable(fileIDs []int) error {
 		quantidade_negociada,
 		hora_fechamento
 	)
-	SELECT 
-		data_negocio,
-		codigo_instrumento,
-		preco_negocio,
-		quantidade_negociada,
-		hora_fechamento
-	FROM trade_loaded_records
-	WHERE file_id = ANY($1) AND is_valid = true;`
+	SELECT * FROM valid_trades;`
 
 	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
@@ -204,14 +202,14 @@ func (m *PostgresDBManager) CleanTempData(fileIDs []int) error {
 }
 
 // InsertMultipleTrades inserts multiple trade records in a single transaction.
-func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, isValid bool) error {
+func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	_, err := m.dbpool.CopyFrom(
 		context.Background(),
 		pgx.Identifier{"trade_loaded_records"},
 		[]string{"data_negocio", "codigo_instrumento", "preco_negocio", "quantidade_negociada", "hora_fechamento", "is_valid", "file_id"},
 		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
 			trade := trades[i]
-			return []any{trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, trade.FileID}, nil
+			return []any{trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, trade.IsValid(), trade.FileID}, nil
 		}),
 	)
 
