@@ -31,32 +31,42 @@ func NewPostgresTickerDBManager(ctx context.Context, connStr string) (*PostgresT
 func (m *PostgresTickerDBManager) GetTickerInfo(ctx context.Context, ticker string, startDate time.Time) (*TickerInfo, error) {
 	info := &TickerInfo{Ticker: ticker}
 
-	// Get max_range_value
-	queryMaxPrice := `
-		SELECT COALESCE(MAX(preco_negocio), 0)
-		FROM trade_records
-		WHERE codigo_instrumento = $1 AND data_negocio >= $2;`
+	query := `
+		WITH
+			max_price_calc AS (
+				SELECT
+					COALESCE(MAX(preco_negocio), 0) AS max_range_value
+				FROM
+					trade_records
+				WHERE
+					codigo_instrumento = $1 AND data_negocio >= $2
+			),
+			daily_volumes AS (
+				SELECT
+					SUM(quantidade_negociada) AS total_volume
+				FROM
+					trade_records
+				WHERE
+					codigo_instrumento = $1 AND data_negocio >= $2
+				GROUP BY
+					DATE(data_negocio)
+			),
+			max_volume_calc AS (
+				SELECT
+					COALESCE(MAX(total_volume), 0) AS max_daily_volume
+				FROM
+					daily_volumes
+			)
+		SELECT
+			max_range_value,
+			max_daily_volume
+		FROM
+			max_price_calc,
+			max_volume_calc;`
 
-	err := m.Pool.QueryRow(ctx, queryMaxPrice, ticker, startDate).Scan(&info.MaxRangeValue)
+	err := m.Pool.QueryRow(ctx, query, ticker, startDate).Scan(&info.MaxRangeValue, &info.MaxDailyVolume)
 	if err != nil {
-		return nil, fmt.Errorf("error querying max price: %w", err)
-	}
-
-	// Get max_daily_volume
-	queryMaxVolume := `
-		WITH daily_volumes AS (
-			SELECT
-				DATE(data_negocio) AS trade_day,
-				SUM(quantidade_negociada) AS total_volume
-			FROM trade_records
-			WHERE codigo_instrumento = $1 AND data_negocio >= $2
-			GROUP BY trade_day
-		)
-		SELECT COALESCE(MAX(total_volume), 0) FROM daily_volumes;`
-
-	err = m.Pool.QueryRow(ctx, queryMaxVolume, ticker, startDate).Scan(&info.MaxDailyVolume)
-	if err != nil {
-		return nil, fmt.Errorf("error querying max daily volume: %w", err)
+		return nil, fmt.Errorf("error querying ticker info: %w", err)
 	}
 
 	return info, nil
