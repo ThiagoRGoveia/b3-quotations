@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
@@ -25,7 +26,8 @@ func (m *PostgresDBManager) CreateFileRecordTable() error {
 		id SERIAL PRIMARY KEY,
 		file_name VARCHAR(255) NOT NULL,
 		date TIMESTAMP NOT NULL,
-		status VARCHAR(50) NOT NULL CHECK (status IN ('DONE', 'PROCESSING', 'ERROR'))
+		status VARCHAR(50) NOT NULL CHECK (status IN ('DONE', 'DONE_WITH_ERRORS', 'PROCESSING', 'FATAL')),
+		errors jsonb
 	);`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
@@ -37,7 +39,7 @@ func (m *PostgresDBManager) CreateFileRecordTable() error {
 }
 
 // CreateTradeLoadRecordTable creates the trade_loaded_records table in the database.
-func (m *PostgresDBManager) CreateTradeLoadRecordTable() error {
+func (m *PostgresDBManager) CreateTradeLoadedRecordTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_loaded_records (
 		id SERIAL PRIMARY KEY,
@@ -54,6 +56,25 @@ func (m *PostgresDBManager) CreateTradeLoadRecordTable() error {
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
 		return fmt.Errorf("error creating trade_loaded_records table: %v", err)
+	}
+
+	return nil
+}
+
+func (m *PostgresDBManager) CreateTradeRecordsTable() error {
+	query := `
+	CREATE TABLE IF NOT EXISTS trade_records (
+		id SERIAL PRIMARY KEY,
+		data_negocio TIMESTAMP NOT NULL,
+		codigo_instrumento VARCHAR(255) NOT NULL,
+		preco_negocio NUMERIC(18, 2) NOT NULL,
+		quantidade_negociada BIGINT NOT NULL,
+		hora_fechamento VARCHAR(50) NOT NULL
+	);`
+
+	_, err := m.dbpool.Exec(context.Background(), query)
+	if err != nil {
+		return fmt.Errorf("error creating trade_records table: %v", err)
 	}
 
 	return nil
@@ -92,18 +113,49 @@ func (m *PostgresDBManager) InsertTrade(trade *models.Trade, isValid bool) (int,
 }
 
 // UpdateFileStatus updates the status of a file record in the database.
-func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string) error {
+func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors []string) error {
 	query := `
 	UPDATE file_records
-	SET status = $1
-	WHERE id = $2;`
+	SET status = $1,
+		errors = $2,
+	WHERE id = $3;`
 
-	_, err := m.dbpool.Exec(context.Background(), query, status, fileID)
+	_, err := m.dbpool.Exec(context.Background(), query, status, errors, fileID)
 	if err != nil {
 		return fmt.Errorf("error updating file status: %v", err)
 	}
 
 	return nil
+}
+
+func (m *PostgresDBManager) ValidateSavedData(fileID int) {
+	query := `
+	UPDATE trade_loaded_records
+	SET is_valid = true
+	WHERE file_id = $1 AND
+		is_valid = false
+		data_negocio IS NOT NULL AND 
+		codigo_instrumento IS NOT NULL AND 
+		preco_negocio IS NOT NULL AND 
+		quantidade_negociada IS NOT NULL AND 
+		hora_fechamento IS NOT NULL;`
+
+	_, err := m.dbpool.Exec(context.Background(), query, fileID)
+	if err != nil {
+		log.Printf("Failed to validate saved data for fileID %d: %v\n", fileID, err)
+	}
+}
+
+func (m *PostgresDBManager) TransferDataToFinalTable(fileID int) {
+	query := `
+	INSERT INTO trade_records
+	SELECT * FROM trade_loaded_records
+	WHERE file_id = $1 AND is_valid = true;`
+
+	_, err := m.dbpool.Exec(context.Background(), query, fileID)
+	if err != nil {
+		log.Printf("Failed to transfer data to final table for fileID %d: %v\n", fileID, err)
+	}
 }
 
 // InsertMultipleTrades inserts multiple trade records in a single transaction.

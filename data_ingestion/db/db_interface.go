@@ -9,9 +9,12 @@ import (
 // DBManager defines the interface for database operations.
 type DBManager interface {
 	CreateFileRecordTable() error
-	CreateTradeLoadRecordTable() error
+	CreateTradeLoadedRecordTable() error
+	CreateTradeRecordsTable() error
 	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
 	InsertTrade(trade *models.Trade, isValid bool) (int, error)
 	InsertMultipleTrades(trades []*models.Trade, isValid bool) error
-	UpdateFileStatus(fileID int, status string) error
+	UpdateFileStatus(fileID int, status string, errors []string) error
+	ValidateSavedData(fileID int)
+	TransferDataToFinalTable(fileID int)
 }

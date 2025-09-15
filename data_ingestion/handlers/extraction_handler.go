@@ -17,31 +17,45 @@ type ExtractionHandler struct {
 	dbManager        db.DBManager
 	jobs             chan models.FileJob
 	results          chan *models.Trade
+	errors           chan models.AppError
 	parserWg         *sync.WaitGroup
 	dbWg             *sync.WaitGroup
+	errorWg          *sync.WaitGroup
 	numParserWorkers int
 	dbBatchSize      int
+
+	fileErrors   map[int][]string
+	fileErrorsMu sync.Mutex
 }
 
 // NewExtractionHandler creates a new ExtractionHandler.
-func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int) *ExtractionHandler {
+func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, errors chan models.AppError, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, errorWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int) *ExtractionHandler {
 	return &ExtractionHandler{
 		dbManager:        dbManager,
 		jobs:             jobs,
 		results:          results,
+		errors:           errors,
 		parserWg:         parserWg,
 		dbWg:             dbWg,
+		errorWg:          errorWg,
 		numParserWorkers: numParserWorkers,
 		dbBatchSize:      dbBatchSize,
+		fileErrors:       make(map[int][]string),
 	}
 }
 
 // Extract orchestrates the file processing workflow.
 func (h *ExtractionHandler) Extract(filesPath string) {
+	processedFiles := make(map[int]string)
+
+	// Start the error worker
+	h.errorWg.Add(1)
+	go h.ErrorWorker()
+
 	// Start parser workers
 	for w := 1; w <= h.numParserWorkers; w++ {
 		h.parserWg.Add(1)
-		go h.ParserWorker(w)
+		go h.ParserWorker()
 	}
 
 	// Start a single DB worker for batch processing
@@ -49,28 +63,34 @@ func (h *ExtractionHandler) Extract(filesPath string) {
 	go h.DBWorker()
 
 	// Goroutine to scan directory and send jobs
-	h.DirectoryWorker(filesPath)
+	h.DirectoryWorker(filesPath, processedFiles)
 
-	// Wait for all parsing jobs to finish and then close the results channel
+	// Wait for all parsing and DB jobs to finish, then close the error channel
 	h.parserWg.Wait()
 	close(h.results)
-
-	// Wait for the DB worker to finish
 	h.dbWg.Wait()
+	close(h.errors)
 
-	log.Println("Extraction process initiated.")
+	// Start the file status worker after all file-related processing is done
+	h.errorWg.Add(1)
+	go h.FileStatusWorker(processedFiles)
+
+	// Wait for the error and status workers to finish
+	h.errorWg.Wait()
+
+	log.Println("Extraction process finished.")
 }
 
 // ParserWorker reads file jobs from a channel, parses the files, and sends the results to another channel.
-func (h *ExtractionHandler) ParserWorker(id int) {
+func (h *ExtractionHandler) ParserWorker() {
 	defer h.parserWg.Done()
 	for job := range h.jobs {
-		log.Printf("Parser worker %d started job for file %s\n", id, job.FilePath)
-		err := parsers.ParseCSV(job.FilePath, job.FileID, h.results)
+		log.Printf("Parser worker started job for file %s (ID: %d)\n", job.FilePath, job.FileID)
+		err := parsers.ParseCSV(job.FilePath, job.FileID, h.results, h.errors)
 		if err != nil {
-			log.Printf("Error parsing %s: %v\n", job.FilePath, err)
+			h.errors <- models.AppError{FileID: job.FileID, Message: "Failed to open or read file", Err: err}
 		}
-		log.Printf("Parser worker %d finished job for file %s\n", id, job.FilePath)
+		log.Printf("Parser worker finished job for file %s (ID: %d)\n", job.FilePath, job.FileID)
 	}
 }
 
@@ -84,7 +104,9 @@ func (h *ExtractionHandler) DBWorker() {
 		if len(trades) >= h.dbBatchSize {
 			err := h.dbManager.InsertMultipleTrades(trades, false)
 			if err != nil {
-				log.Printf("Error inserting batch of trades: %v\n", err)
+				if len(trades) > 0 {
+					h.errors <- models.AppError{FileID: trades[0].FileID, Message: "Failed to insert batch of trades", Err: err}
+				}
 			}
 			trades = trades[:0] // Clear the slice
 		}
@@ -94,18 +116,53 @@ func (h *ExtractionHandler) DBWorker() {
 	if len(trades) > 0 {
 		err := h.dbManager.InsertMultipleTrades(trades, false)
 		if err != nil {
-			log.Printf("Error inserting remaining batch of trades: %v\n", err)
+			if len(trades) > 0 {
+				h.errors <- models.AppError{FileID: trades[0].FileID, Message: "Failed to insert remaining batch of trades", Err: err}
+			}
 		}
 	}
 }
 
-func (h *ExtractionHandler) DirectoryWorker(filesPath string) {
+// ErrorWorker listens on the error channel, logs the errors, and tracks them by FileID.
+func (h *ExtractionHandler) ErrorWorker() {
+	defer h.errorWg.Done()
+	for appErr := range h.errors {
+		log.Printf("Caught error: %s\n", appErr.Error())
+		if appErr.FileID != -1 {
+			h.fileErrorsMu.Lock()
+			h.fileErrors[appErr.FileID] = append(h.fileErrors[appErr.FileID], appErr.Error())
+			h.fileErrorsMu.Unlock()
+		}
+	}
+}
+
+// FileStatusWorker updates the final status of each processed file based on whether errors occurred.
+func (h *ExtractionHandler) FileStatusWorker(processedFiles map[int]string) {
+	defer h.errorWg.Done()
+
+	h.fileErrorsMu.Lock()
+	defer h.fileErrorsMu.Unlock()
+
+	for fileID := range processedFiles {
+		errors := h.fileErrors[fileID]
+		status := db.FILE_STATUS_DONE
+		if len(errors) > 0 {
+			status = db.FILE_STATUS_DONE_WITH_ERRORS
+		}
+
+		if err := h.dbManager.UpdateFileStatus(fileID, status, errors); err != nil {
+			log.Printf("Failed to update status for fileID %d: %v\n", fileID, err)
+		}
+	}
+}
+
+func (h *ExtractionHandler) DirectoryWorker(filesPath string, processedFiles map[int]string) {
 
 	defer close(h.jobs)
-	processedFiles := make(map[int]string)
 
 	filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			h.errors <- models.AppError{FileID: -1, Message: "Failed to walk directory", Err: err}
 			return err
 		}
 		if !info.IsDir() {

@@ -41,9 +41,10 @@ func parseRecord(record []string, fileID int) (*models.Trade, error) {
 }
 
 // ParseCSV reads a CSV file from the given path and streams parsed records into a channel.
-func ParseCSV(filePath string, fileID int, results chan<- *models.Trade) error {
+func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors chan<- models.AppError) error {
 	file, err := os.Open(filePath)
 	if err != nil {
+		errors <- models.AppError{FileID: fileID, Message: "Failed to open file", Err: err}
 		return err
 	}
 	defer file.Close()
@@ -53,6 +54,7 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade) error {
 
 	// Skip header
 	if _, err := reader.Read(); err != nil {
+		errors <- models.AppError{FileID: fileID, Message: "Failed to read header from CSV", Err: err}
 		return err
 	}
 
@@ -62,12 +64,14 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade) error {
 			break
 		}
 		if err != nil {
-			continue // Skip corrupted records // add this error to log later
+			errors <- models.AppError{FileID: fileID, Message: "Failed to read record from CSV", Err: err}
+			continue // Skip corrupted records
 		}
 
 		trade, err := parseRecord(record, fileID)
 		if err != nil {
-			continue // Skip records that can't be parsed // add this error to log later
+			errors <- models.AppError{FileID: fileID, Message: "Failed to parse record", Err: err}
+			continue // Skip records that can't be parsed
 		}
 
 		results <- trade
