@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

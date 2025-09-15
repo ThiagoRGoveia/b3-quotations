@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
 )
 
 // parseRecord parses a single CSV record into a Trade struct.

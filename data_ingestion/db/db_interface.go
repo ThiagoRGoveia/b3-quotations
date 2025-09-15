@@ -3,7 +3,7 @@ package db
 import (
 	"time"
 
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
 )
 
 // DBManager defines the interface for database operations.

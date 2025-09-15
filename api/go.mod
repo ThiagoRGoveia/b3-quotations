@@ -1,4 +1,4 @@
-module github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion
+module github.com/thiago-r-goveia/b3-quotations/api/handlers
 
 go 1.23.0
 

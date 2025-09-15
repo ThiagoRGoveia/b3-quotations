@@ -5,9 +5,9 @@ import (
 	"os"
 	"sync"
 
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/db"
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/handlers"
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/db"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/handlers"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
 )
 
 const (

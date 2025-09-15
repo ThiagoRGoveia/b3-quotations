@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/db"
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
-	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/parsers"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/db"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/parsers"
 )
 
 // ExtractionHandler manages the data extraction and processing workflow.
@@ -123,8 +123,16 @@ func (h *ExtractionHandler) DBWorker() {
 		if len(trades) >= h.dbBatchSize {
 			err := h.dbManager.InsertMultipleTrades(trades, false)
 			if err != nil {
-				if len(trades) > 0 {
-					h.errors <- models.AppError{FileID: trades[0].FileID, Message: "Failed to insert batch of trades", Err: err}
+				// The batch failed, so report an error for each unique FileID in the batch.
+				// Maybe log the trades that failed? A next step here is retry logic but since
+				// the error here suggests network or database connection issues, it's better
+				// to report the error and let the user handle it.
+				fileIDs := make(map[int]bool)
+				for _, trade := range trades {
+					fileIDs[trade.FileID] = true
+				}
+				for fileID := range fileIDs {
+					h.errors <- models.AppError{FileID: fileID, Message: "Failed to insert batch of trades", Err: err}
 				}
 			}
 			trades = trades[:0] // Clear the slice
@@ -135,8 +143,13 @@ func (h *ExtractionHandler) DBWorker() {
 	if len(trades) > 0 {
 		err := h.dbManager.InsertMultipleTrades(trades, false)
 		if err != nil {
-			if len(trades) > 0 {
-				h.errors <- models.AppError{FileID: trades[0].FileID, Message: "Failed to insert remaining batch of trades", Err: err}
+			// The batch failed, so report an error for each unique FileID in the batch.
+			fileIDs := make(map[int]bool)
+			for _, trade := range trades {
+				fileIDs[trade.FileID] = true
+			}
+			for fileID := range fileIDs {
+				h.errors <- models.AppError{FileID: fileID, Message: "Failed to insert remaining batch of trades", Err: err}
 			}
 		}
 	}
