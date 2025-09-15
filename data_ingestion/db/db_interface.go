@@ -12,8 +12,8 @@ type DBManager interface {
 	CreateTradeLoadedRecordTable() error
 	CreateTradeRecordsTable() error
 	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
-	InsertTrade(trade *models.Trade, isValid bool) (int, error)
-	InsertMultipleTrades(trades []*models.Trade, isValid bool) error
+	InsertTrade(trade *models.Trade) (int, error)
+	InsertMultipleTrades(trades []*models.Trade) error
 	UpdateFileStatus(fileID int, status string, errors []string) error
 	ValidateSavedData(fileIDs []int) error
 	TransferDataToFinalTable(fileIDs []int) error
