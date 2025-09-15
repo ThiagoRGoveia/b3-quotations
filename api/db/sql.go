@@ -32,37 +32,28 @@ func (m *PostgresTickerDBManager) GetTickerInfo(ctx context.Context, ticker stri
 	info := &TickerInfo{Ticker: ticker}
 
 	query := `
-		WITH
-			max_price_calc AS (
+		WITH filtered_trades AS (
+    SELECT
+        preco_negocio,
+        quantidade_negociada,
+        data_negocio
+    FROM
+        trade_records
+    WHERE
+        codigo_instrumento = $1 AND data_negocio >= $2
+		),
+		daily_volumes AS (
 				SELECT
-					COALESCE(MAX(preco_negocio), 0) AS max_range_value
+						DATE(data_negocio) AS trade_date,
+						SUM(quantidade_negociada) AS total_volume
 				FROM
-					trade_records
-				WHERE
-					codigo_instrumento = $1 AND data_negocio >= $2
-			),
-			daily_volumes AS (
-				SELECT
-					SUM(quantidade_negociada) AS total_volume
-				FROM
-					trade_records
-				WHERE
-					codigo_instrumento = $1 AND data_negocio >= $2
+						filtered_trades
 				GROUP BY
-					DATE(data_negocio)
-			),
-			max_volume_calc AS (
-				SELECT
-					COALESCE(MAX(total_volume), 0) AS max_daily_volume
-				FROM
-					daily_volumes
-			)
+						trade_date
+		)
 		SELECT
-			max_range_value,
-			max_daily_volume
-		FROM
-			max_price_calc,
-			max_volume_calc;`
+				(SELECT COALESCE(MAX(preco_negocio), 0) FROM filtered_trades) AS max_range_value,
+				(SELECT COALESCE(MAX(total_volume), 0) FROM daily_volumes) AS max_daily_volume;`
 
 	err := m.Pool.QueryRow(ctx, query, ticker, startDate).Scan(&info.MaxRangeValue, &info.MaxDailyVolume)
 	if err != nil {
