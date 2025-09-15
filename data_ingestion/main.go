@@ -22,6 +22,7 @@ func main() {
 	dbpool, err := db.ConnectDB()
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
+		os.Exit(1)
 	}
 	defer dbpool.Close()
 
@@ -41,5 +42,11 @@ func main() {
 
 	handler := handlers.NewExtractionHandler(dbManager, jobs, results, errors, &parserWg, &dbWg, &errorWg, numParserWorkers, 100)
 
-	handler.Extract(filesPath)
+	err = handler.Extract(filesPath)
+	if err != nil {
+		log.Fatalf("Error during extraction: %v\n", err)
+		os.Exit(1)
+	}
+
+	log.Println("Extraction process finished.")
 }

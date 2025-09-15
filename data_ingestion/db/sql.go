@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
@@ -128,11 +127,11 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors [
 	return nil
 }
 
-func (m *PostgresDBManager) ValidateSavedData(fileID int) {
+func (m *PostgresDBManager) ValidateSavedData(fileIDs []int) error {
 	query := `
 	UPDATE trade_loaded_records
 	SET is_valid = true
-	WHERE file_id = $1 AND
+	WHERE file_id in ($1) AND
 		is_valid = false
 		data_negocio IS NOT NULL AND 
 		codigo_instrumento IS NOT NULL AND 
@@ -140,22 +139,39 @@ func (m *PostgresDBManager) ValidateSavedData(fileID int) {
 		quantidade_negociada IS NOT NULL AND 
 		hora_fechamento IS NOT NULL;`
 
-	_, err := m.dbpool.Exec(context.Background(), query, fileID)
+	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
-		log.Printf("Failed to validate saved data for fileID %d: %v\n", fileID, err)
+		return fmt.Errorf("error validating saved data: %v", err)
 	}
+
+	return nil
 }
 
-func (m *PostgresDBManager) TransferDataToFinalTable(fileID int) {
+func (m *PostgresDBManager) TransferDataToFinalTable(fileIDs []int) error {
 	query := `
 	INSERT INTO trade_records
 	SELECT * FROM trade_loaded_records
-	WHERE file_id = $1 AND is_valid = true;`
+	WHERE file_id in ($1) AND is_valid = true;`
 
-	_, err := m.dbpool.Exec(context.Background(), query, fileID)
+	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
-		log.Printf("Failed to transfer data to final table for fileID %d: %v\n", fileID, err)
+		return fmt.Errorf("error transferring data to final table: %v", err)
 	}
+
+	return nil
+}
+
+func (m *PostgresDBManager) CleanTempData(fileIDs []int) error {
+	query := `
+	DELETE FROM trade_loaded_records
+	WHERE file_id in ($1) AND is_valid = true;`
+
+	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
+	if err != nil {
+		return fmt.Errorf("error cleaning temp data: %v", err)
+	}
+
+	return nil
 }
 
 // InsertMultipleTrades inserts multiple trade records in a single transaction.

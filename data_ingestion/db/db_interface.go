@@ -15,6 +15,7 @@ type DBManager interface {
 	InsertTrade(trade *models.Trade, isValid bool) (int, error)
 	InsertMultipleTrades(trades []*models.Trade, isValid bool) error
 	UpdateFileStatus(fileID int, status string, errors []string) error
-	ValidateSavedData(fileID int)
-	TransferDataToFinalTable(fileID int)
+	ValidateSavedData(fileIDs []int) error
+	TransferDataToFinalTable(fileIDs []int) error
+	CleanTempData(fileIDs []int) error
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -45,7 +46,7 @@ func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, resu
 }
 
 // Extract orchestrates the file processing workflow.
-func (h *ExtractionHandler) Extract(filesPath string) {
+func (h *ExtractionHandler) Extract(filesPath string) error {
 	processedFiles := make(map[int]string)
 
 	// Start the error worker
@@ -78,7 +79,25 @@ func (h *ExtractionHandler) Extract(filesPath string) {
 	// Wait for the error and status workers to finish
 	h.errorWg.Wait()
 
+	fileIDs := make([]int, 0, len(processedFiles))
+	for fileID := range processedFiles {
+		fileIDs = append(fileIDs, fileID)
+	}
+	err := h.dbManager.ValidateSavedData(fileIDs)
+	if err != nil {
+		return fmt.Errorf("error validating saved data: %v", err)
+	}
+	err = h.dbManager.TransferDataToFinalTable(fileIDs)
+	if err != nil {
+		return fmt.Errorf("error transferring data to final table: %v", err)
+	}
+	err = h.dbManager.CleanTempData(fileIDs)
+	if err != nil {
+		return fmt.Errorf("error cleaning temp data: %v", err)
+	}
+
 	log.Println("Extraction process finished.")
+	return nil
 }
 
 // ParserWorker reads file jobs from a channel, parses the files, and sends the results to another channel.
@@ -128,10 +147,14 @@ func (h *ExtractionHandler) ErrorWorker() {
 	defer h.errorWg.Done()
 	for appErr := range h.errors {
 		log.Printf("Caught error: %s\n", appErr.Error())
-		if appErr.FileID != -1 {
+		// limit the number of errors per file to prevent memory overflow, if more than 100 errors are collected, then file is probably malformed
+		if appErr.FileID != -1 && len(h.fileErrors) < 100 {
 			h.fileErrorsMu.Lock()
 			h.fileErrors[appErr.FileID] = append(h.fileErrors[appErr.FileID], appErr.Error())
 			h.fileErrorsMu.Unlock()
+		} else if appErr.FileID != -1 {
+			// File has too many errors, skip it, and log for manual inspection
+			log.Printf("File %d has too many errors, skipping\n", appErr.FileID)
 		}
 	}
 }
