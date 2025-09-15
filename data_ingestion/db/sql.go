@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -92,6 +93,25 @@ func UpdateFileStatus(dbpool *pgxpool.Pool, fileID int, status string) error {
 	_, err := dbpool.Exec(context.Background(), query, status, fileID)
 	if err != nil {
 		return fmt.Errorf("error updating file status: %v", err)
+	}
+
+	return nil
+}
+
+// InsertMultipleTrades inserts multiple trade records in a single transaction.
+func InsertMultipleTrades(dbpool *pgxpool.Pool, trades []*models.Trade, isValid bool) error {
+	_, err := dbpool.CopyFrom(
+		context.Background(),
+		pgx.Identifier{"trade_loaded_records"},
+		[]string{"data_negocio", "codigo_instrumento", "preco_negocio", "quantidade_negociada", "hora_fechamento", "is_valid", "file_id"},
+		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
+			trade := trades[i]
+			return []any{trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, trade.FileID}, nil
+		}),
+	)
+
+	if err != nil {
+		return fmt.Errorf("unable to copy trades from slice: %v", err)
 	}
 
 	return nil

@@ -22,10 +22,11 @@ type ExtractionHandler struct {
 	parserWg         *sync.WaitGroup
 	dbWg             *sync.WaitGroup
 	numParserWorkers int
+	dbBatchSize      int
 }
 
 // NewExtractionHandler creates a new ExtractionHandler.
-func NewExtractionHandler(dbManager db.DBManager, dbpool *pgxpool.Pool, jobs chan models.FileJob, results chan *models.Trade, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, numParserWorkers int) *ExtractionHandler {
+func NewExtractionHandler(dbManager db.DBManager, dbpool *pgxpool.Pool, jobs chan models.FileJob, results chan *models.Trade, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int) *ExtractionHandler {
 	return &ExtractionHandler{
 		dbManager:        dbManager,
 		dbpool:           dbpool,
@@ -34,6 +35,7 @@ func NewExtractionHandler(dbManager db.DBManager, dbpool *pgxpool.Pool, jobs cha
 		parserWg:         parserWg,
 		dbWg:             dbWg,
 		numParserWorkers: numParserWorkers,
+		dbBatchSize:      dbBatchSize,
 	}
 }
 
@@ -45,12 +47,9 @@ func (h *ExtractionHandler) Extract(filesPath string) {
 		go h.ParserWorker(w)
 	}
 
-	// Start DB workers
-	dbWorkerCount := int(h.dbpool.Config().MaxConns)
-	for range dbWorkerCount {
-		h.dbWg.Add(1)
-		go h.DBWorker()
-	}
+	// Start a single DB worker for batch processing
+	h.dbWg.Add(1)
+	go h.DBWorker()
 
 	// Goroutine to scan directory and send jobs
 	h.DirectoryWorker(filesPath)
@@ -59,7 +58,7 @@ func (h *ExtractionHandler) Extract(filesPath string) {
 	h.parserWg.Wait()
 	close(h.results)
 
-	// Wait for all DB workers to finish
+	// Wait for the DB worker to finish
 	h.dbWg.Wait()
 
 	log.Println("Extraction process initiated.")
@@ -78,13 +77,27 @@ func (h *ExtractionHandler) ParserWorker(id int) {
 	}
 }
 
-// DBWorker processes trades from a channel and inserts them into the database.
+// DBWorker processes trades from a channel and inserts them into the database in batches.
 func (h *ExtractionHandler) DBWorker() {
 	defer h.dbWg.Done()
+	trades := make([]*models.Trade, 0, h.dbBatchSize)
+
 	for result := range h.results {
-		_, err := h.dbManager.InsertTrade(h.dbpool, result, false) // is_valid is false as requested
+		trades = append(trades, result)
+		if len(trades) >= h.dbBatchSize {
+			err := h.dbManager.InsertMultipleTrades(h.dbpool, trades, false)
+			if err != nil {
+				log.Printf("Error inserting batch of trades: %v\n", err)
+			}
+			trades = trades[:0] // Clear the slice
+		}
+	}
+
+	// Insert any remaining trades
+	if len(trades) > 0 {
+		err := h.dbManager.InsertMultipleTrades(h.dbpool, trades, false)
 		if err != nil {
-			log.Printf("Error inserting trade: %v\n", err)
+			log.Printf("Error inserting remaining batch of trades: %v\n", err)
 		}
 	}
 }

@@ -11,5 +11,6 @@ import (
 type DBManager interface {
 	InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, status string) (int, error)
 	InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, isValid bool) (int, error)
+	InsertMultipleTrades(dbpool *pgxpool.Pool, trades []*models.Trade, isValid bool) error
 	UpdateFileStatus(dbpool *pgxpool.Pool, fileID int, status string) error
 }
