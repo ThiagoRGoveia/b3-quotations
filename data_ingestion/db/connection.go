@@ -10,6 +10,9 @@ import (
 
 func ConnectDB() (*pgxpool.Pool, error) {
 	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		panic("DATABASE_URL environment variable is not set")
+	}
 	dbpool, err := pgxpool.New(context.Background(), connStr)
 	if err != nil {
 		return nil, fmt.Errorf("unable to connect to database: %v", err)

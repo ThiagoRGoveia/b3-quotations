@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -24,13 +23,14 @@ type ExtractionHandler struct {
 	errorWg          *sync.WaitGroup
 	numParserWorkers int
 	dbBatchSize      int
+	numDBWorkers     int
 
 	fileErrors   map[int][]string
 	fileErrorsMu sync.Mutex
 }
 
 // NewExtractionHandler creates a new ExtractionHandler.
-func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, errors chan models.AppError, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, errorWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int) *ExtractionHandler {
+func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, errors chan models.AppError, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, errorWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int, numDBWorkers int) *ExtractionHandler {
 	return &ExtractionHandler{
 		dbManager:        dbManager,
 		jobs:             jobs,
@@ -41,6 +41,7 @@ func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, resu
 		errorWg:          errorWg,
 		numParserWorkers: numParserWorkers,
 		dbBatchSize:      dbBatchSize,
+		numDBWorkers:     numDBWorkers,
 		fileErrors:       make(map[int][]string),
 	}
 }
@@ -59,9 +60,11 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 		go h.ParserWorker()
 	}
 
-	// Start a single DB worker for batch processing
-	h.dbWg.Add(1)
-	go h.DBWorker()
+	// Start DB workers
+	for w := 1; w <= h.numDBWorkers; w++ {
+		h.dbWg.Add(1)
+		go h.DBWorker()
+	}
 
 	// Goroutine to scan directory and send jobs
 	h.DirectoryWorker(filesPath, processedFiles)
@@ -78,23 +81,6 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 
 	// Wait for the error and status workers to finish
 	h.errorWg.Wait()
-
-	fileIDs := make([]int, 0, len(processedFiles))
-	for fileID := range processedFiles {
-		fileIDs = append(fileIDs, fileID)
-	}
-	err := h.dbManager.ValidateSavedData(fileIDs)
-	if err != nil {
-		return fmt.Errorf("error validating saved data: %v", err)
-	}
-	err = h.dbManager.TransferDataToFinalTable(fileIDs)
-	if err != nil {
-		return fmt.Errorf("error transferring data to final table: %v", err)
-	}
-	err = h.dbManager.CleanTempData(fileIDs)
-	if err != nil {
-		return fmt.Errorf("error cleaning temp data: %v", err)
-	}
 
 	log.Println("Extraction process finished.")
 	return nil
@@ -153,6 +139,8 @@ func (h *ExtractionHandler) DBWorker() {
 			}
 		}
 	}
+
+	log.Println("DB worker finished.")
 }
 
 // ErrorWorker listens on the error channel, logs the errors, and tracks them by FileID.

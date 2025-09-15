@@ -116,7 +116,7 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors [
 	query := `
 	UPDATE file_records
 	SET status = $1,
-		errors = $2,
+		errors = $2
 	WHERE id = $3;`
 
 	_, err := m.dbpool.Exec(context.Background(), query, status, errors, fileID)
@@ -129,19 +129,36 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors [
 
 func (m *PostgresDBManager) ValidateSavedData(fileIDs []int) error {
 	query := `
+	CREATE INDEX IF NOT EXISTS idx_trade_loaded_records_file_id
+	ON trade_loaded_records (file_id);`
+
+	_, err := m.dbpool.Exec(context.Background(), query)
+	if err != nil {
+		return fmt.Errorf("error creating index: %v", err)
+	}
+
+	query = `
 	UPDATE trade_loaded_records
 	SET is_valid = true
-	WHERE file_id in ($1) AND
-		is_valid = false
+	WHERE file_id = ANY($1) AND
+		is_valid = false AND
 		data_negocio IS NOT NULL AND 
 		codigo_instrumento IS NOT NULL AND 
 		preco_negocio IS NOT NULL AND 
 		quantidade_negociada IS NOT NULL AND 
 		hora_fechamento IS NOT NULL;`
 
-	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
+	_, err = m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
 		return fmt.Errorf("error validating saved data: %v", err)
+	}
+
+	query = `
+	DROP INDEX IF EXISTS idx_trade_loaded_records_file_id;`
+
+	_, err = m.dbpool.Exec(context.Background(), query)
+	if err != nil {
+		return fmt.Errorf("error dropping index: %v", err)
 	}
 
 	return nil
@@ -149,9 +166,21 @@ func (m *PostgresDBManager) ValidateSavedData(fileIDs []int) error {
 
 func (m *PostgresDBManager) TransferDataToFinalTable(fileIDs []int) error {
 	query := `
-	INSERT INTO trade_records
-	SELECT * FROM trade_loaded_records
-	WHERE file_id in ($1) AND is_valid = true;`
+	INSERT INTO trade_records (
+		data_negocio,
+		codigo_instrumento,
+		preco_negocio,
+		quantidade_negociada,
+		hora_fechamento
+	)
+	SELECT 
+		data_negocio,
+		codigo_instrumento,
+		preco_negocio,
+		quantidade_negociada,
+		hora_fechamento
+	FROM trade_loaded_records
+	WHERE file_id = ANY($1) AND is_valid = true;`
 
 	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
@@ -164,7 +193,7 @@ func (m *PostgresDBManager) TransferDataToFinalTable(fileIDs []int) error {
 func (m *PostgresDBManager) CleanTempData(fileIDs []int) error {
 	query := `
 	DELETE FROM trade_loaded_records
-	WHERE file_id in ($1) AND is_valid = true;`
+	WHERE file_id = ANY($1) AND is_valid = true;`
 
 	_, err := m.dbpool.Exec(context.Background(), query, fileIDs)
 	if err != nil {
