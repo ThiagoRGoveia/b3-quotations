@@ -7,12 +7,17 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/joho/godotenv"
 	"github.com/thiago-r-goveia/b3-quotations/api/handlers/db"
 	"github.com/thiago-r-goveia/b3-quotations/api/handlers/handlers"
 	"github.com/thiago-r-goveia/b3-quotations/api/handlers/routes"
 )
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
 	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
 		log.Fatal("DATABASE_URL environment variable is not set")
