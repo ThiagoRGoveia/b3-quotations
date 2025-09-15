@@ -10,13 +10,11 @@ import (
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/db"
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/parsers"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ExtractionHandler manages the data extraction and processing workflow.
 type ExtractionHandler struct {
 	dbManager        db.DBManager
-	dbpool           *pgxpool.Pool
 	jobs             chan models.FileJob
 	results          chan *models.Trade
 	parserWg         *sync.WaitGroup
@@ -26,10 +24,9 @@ type ExtractionHandler struct {
 }
 
 // NewExtractionHandler creates a new ExtractionHandler.
-func NewExtractionHandler(dbManager db.DBManager, dbpool *pgxpool.Pool, jobs chan models.FileJob, results chan *models.Trade, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int) *ExtractionHandler {
+func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int) *ExtractionHandler {
 	return &ExtractionHandler{
 		dbManager:        dbManager,
-		dbpool:           dbpool,
 		jobs:             jobs,
 		results:          results,
 		parserWg:         parserWg,
@@ -85,7 +82,7 @@ func (h *ExtractionHandler) DBWorker() {
 	for result := range h.results {
 		trades = append(trades, result)
 		if len(trades) >= h.dbBatchSize {
-			err := h.dbManager.InsertMultipleTrades(h.dbpool, trades, false)
+			err := h.dbManager.InsertMultipleTrades(trades, false)
 			if err != nil {
 				log.Printf("Error inserting batch of trades: %v\n", err)
 			}
@@ -95,7 +92,7 @@ func (h *ExtractionHandler) DBWorker() {
 
 	// Insert any remaining trades
 	if len(trades) > 0 {
-		err := h.dbManager.InsertMultipleTrades(h.dbpool, trades, false)
+		err := h.dbManager.InsertMultipleTrades(trades, false)
 		if err != nil {
 			log.Printf("Error inserting remaining batch of trades: %v\n", err)
 		}
@@ -113,7 +110,7 @@ func (h *ExtractionHandler) DirectoryWorker(filesPath string) {
 		}
 		if !info.IsDir() {
 			// Synchronously create file record and get ID
-			fileID, err := h.dbManager.InsertFileRecord(h.dbpool, path, time.Now(), db.FILE_STATUS_PROCESSING)
+			fileID, err := h.dbManager.InsertFileRecord(path, time.Now(), db.FILE_STATUS_PROCESSING)
 			if err != nil {
 				log.Printf("Error inserting file record for %s: %v\n", path, err)
 				return nil // Continue to next file

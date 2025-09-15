@@ -25,9 +25,16 @@ func main() {
 	results := make(chan *models.Trade, 100)
 	var parserWg, dbWg sync.WaitGroup
 
-	var dbManager db.DBManager
+	dbManager := db.NewPostgresDBManager(dbpool)
 
-	handler := handlers.NewExtractionHandler(dbManager, dbpool, jobs, results, &parserWg, &dbWg, numParserWorkers, 100)
+	if err := dbManager.CreateFileRecordTable(); err != nil {
+		log.Fatalf("Unable to create file_records table: %v\n", err)
+	}
+	if err := dbManager.CreateTradeLoadRecordTable(); err != nil {
+		log.Fatalf("Unable to create trade_loaded_records table: %v\n", err)
+	}
+
+	handler := handlers.NewExtractionHandler(dbManager, jobs, results, &parserWg, &dbWg, numParserWorkers, 100)
 
 	handler.Extract(filesPath)
 }

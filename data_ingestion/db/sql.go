@@ -10,8 +10,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type PostgresDBManager struct {
+	dbpool *pgxpool.Pool
+}
+
+func NewPostgresDBManager(pool *pgxpool.Pool) *PostgresDBManager {
+	return &PostgresDBManager{dbpool: pool}
+}
+
 // CreateFileRecordTable creates the file_records table in the database.
-func CreateFileRecordTable(dbpool *pgxpool.Pool) error {
+func (m *PostgresDBManager) CreateFileRecordTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS file_records (
 		id SERIAL PRIMARY KEY,
@@ -20,7 +28,7 @@ func CreateFileRecordTable(dbpool *pgxpool.Pool) error {
 		status VARCHAR(50) NOT NULL CHECK (status IN ('DONE', 'PROCESSING', 'ERROR'))
 	);`
 
-	_, err := dbpool.Exec(context.Background(), query)
+	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
 		return fmt.Errorf("error creating file_records table: %v", err)
 	}
@@ -29,7 +37,7 @@ func CreateFileRecordTable(dbpool *pgxpool.Pool) error {
 }
 
 // CreateTradeLoadRecordTable creates the trade_loaded_records table in the database.
-func CreateTradeLoadRecordTable(dbpool *pgxpool.Pool) error {
+func (m *PostgresDBManager) CreateTradeLoadRecordTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_loaded_records (
 		id SERIAL PRIMARY KEY,
@@ -43,7 +51,7 @@ func CreateTradeLoadRecordTable(dbpool *pgxpool.Pool) error {
 		FOREIGN KEY (file_id) REFERENCES file_records(id)
 	);`
 
-	_, err := dbpool.Exec(context.Background(), query)
+	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
 		return fmt.Errorf("error creating trade_loaded_records table: %v", err)
 	}
@@ -52,14 +60,14 @@ func CreateTradeLoadRecordTable(dbpool *pgxpool.Pool) error {
 }
 
 // InsertFileRecord inserts a new file record into the file_records table.
-func InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, status string) (int, error) {
+func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, status string) (int, error) {
 	query := `
 	INSERT INTO file_records (file_name, date, status)
 	VALUES ($1, $2, $3)
 	RETURNING id;`
 
 	var fileID int
-	err := dbpool.QueryRow(context.Background(), query, fileName, date, status).Scan(&fileID)
+	err := m.dbpool.QueryRow(context.Background(), query, fileName, date, status).Scan(&fileID)
 	if err != nil {
 		return 0, fmt.Errorf("error inserting file record: %v", err)
 	}
@@ -68,14 +76,14 @@ func InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, sta
 }
 
 // InsertTrade inserts a new trade record into the trade_loaded_records table.
-func InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, isValid bool) (int, error) {
+func (m *PostgresDBManager) InsertTrade(trade *models.Trade, isValid bool) (int, error) {
 	query := `
 	INSERT INTO trade_loaded_records (data_negocio, codigo_instrumento, preco_negocio, quantidade_negociada, hora_fechamento, is_valid, file_id)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	RETURNING id;`
 
 	var tradeID int
-	err := dbpool.QueryRow(context.Background(), query, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, trade.FileID).Scan(&tradeID)
+	err := m.dbpool.QueryRow(context.Background(), query, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, isValid, trade.FileID).Scan(&tradeID)
 	if err != nil {
 		return 0, fmt.Errorf("error inserting trade: %v", err)
 	}
@@ -84,13 +92,13 @@ func InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, isValid bool) (int, 
 }
 
 // UpdateFileStatus updates the status of a file record in the database.
-func UpdateFileStatus(dbpool *pgxpool.Pool, fileID int, status string) error {
+func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string) error {
 	query := `
 	UPDATE file_records
 	SET status = $1
 	WHERE id = $2;`
 
-	_, err := dbpool.Exec(context.Background(), query, status, fileID)
+	_, err := m.dbpool.Exec(context.Background(), query, status, fileID)
 	if err != nil {
 		return fmt.Errorf("error updating file status: %v", err)
 	}
@@ -99,8 +107,8 @@ func UpdateFileStatus(dbpool *pgxpool.Pool, fileID int, status string) error {
 }
 
 // InsertMultipleTrades inserts multiple trade records in a single transaction.
-func InsertMultipleTrades(dbpool *pgxpool.Pool, trades []*models.Trade, isValid bool) error {
-	_, err := dbpool.CopyFrom(
+func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, isValid bool) error {
+	_, err := m.dbpool.CopyFrom(
 		context.Background(),
 		pgx.Identifier{"trade_loaded_records"},
 		[]string{"data_negocio", "codigo_instrumento", "preco_negocio", "quantidade_negociada", "hora_fechamento", "is_valid", "file_id"},

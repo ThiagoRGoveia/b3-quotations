@@ -4,13 +4,14 @@ import (
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-cotations.git/data-ingestion/models"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // DBManager defines the interface for database operations.
 type DBManager interface {
-	InsertFileRecord(dbpool *pgxpool.Pool, fileName string, date time.Time, status string) (int, error)
-	InsertTrade(dbpool *pgxpool.Pool, trade *models.Trade, isValid bool) (int, error)
-	InsertMultipleTrades(dbpool *pgxpool.Pool, trades []*models.Trade, isValid bool) error
-	UpdateFileStatus(dbpool *pgxpool.Pool, fileID int, status string) error
+	CreateFileRecordTable() error
+	CreateTradeLoadRecordTable() error
+	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
+	InsertTrade(trade *models.Trade, isValid bool) (int, error)
+	InsertMultipleTrades(trades []*models.Trade, isValid bool) error
+	UpdateFileStatus(fileID int, status string) error
 }
