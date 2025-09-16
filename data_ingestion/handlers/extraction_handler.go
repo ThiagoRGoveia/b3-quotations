@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -52,7 +54,6 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
-	h.dbManager.CreateTradeRecordsStagingTable()
 	h.dbManager.CreateTradeRecordIndexes()
 
 	// Start the error worker
@@ -65,10 +66,25 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 		go h.ParserWorker()
 	}
 
-	// Start DB workers
+	// CHANGE: Create a unique staging table for each DB worker before it starts.
 	for w := 1; w <= h.numDBWorkers; w++ {
+		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
+
+		// Create the table for the worker.
+		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
+			// This is a fatal startup error, we cannot proceed.
+			return fmt.Errorf("failed to create staging table for worker %d: %w", w, err)
+		}
+
+		// DEFER the dropping of the table. This ensures cleanup even if the application panics.
+		defer func(tableName string) {
+			log.Printf("Cleaning up staging table %s", tableName)
+			h.dbManager.DropWorkerStagingTable(tableName)
+		}(stagingTableName)
+
+		// Start the DB worker and pass its unique table name.
 		h.dbWg.Add(1)
-		go h.DBWorker(w)
+		go h.DBWorker(w, stagingTableName)
 	}
 
 	// Goroutine to scan directory and send jobs
@@ -105,15 +121,17 @@ func (h *ExtractionHandler) ParserWorker() {
 }
 
 // DBWorker processes trades from a channel and inserts them into the database in batches.
-func (h *ExtractionHandler) DBWorker(workerId int) {
+func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
 	defer h.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.dbBatchSize)
+	ctx := context.Background()
 
 	for result := range h.results {
 		trades = append(trades, result)
 		if len(trades) >= h.dbBatchSize {
-			log.Printf("DB Worker %d: Inserting batch of %d trades\n", workerId, len(trades))
-			err := h.dbManager.InsertMultipleTrades(trades)
+			log.Printf("DB Worker %d: Inserting batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
+			// CHANGE: Pass the context and the worker's unique staging table name.
+			err := h.dbManager.InsertMultipleTrades(ctx, trades, stagingTableName)
 			if err != nil {
 				// The batch failed, so report an error for each unique FileID in the batch.
 				// Maybe log the trades that failed? A next step here is retry logic but since
@@ -133,7 +151,9 @@ func (h *ExtractionHandler) DBWorker(workerId int) {
 
 	// Insert any remaining trades
 	if len(trades) > 0 {
-		err := h.dbManager.InsertMultipleTrades(trades)
+		log.Printf("DB Worker %d: Inserting final batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
+		// CHANGE: Pass the context and the worker's unique staging table name.
+		err := h.dbManager.InsertMultipleTrades(ctx, trades, stagingTableName)
 		if err != nil {
 			// The batch failed, so report an error for each unique FileID in the batch.
 			fileIDs := make(map[int]bool)
@@ -146,7 +166,7 @@ func (h *ExtractionHandler) DBWorker(workerId int) {
 		}
 	}
 
-	log.Println("DB worker finished.")
+	log.Printf("DB worker %d finished.", workerId)
 }
 
 // ErrorWorker listens on the error channel, logs the errors, and tracks them by FileID.

@@ -11,6 +11,16 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: always
+    command:
+      - "-c"
+      - "maintenance_work_mem=4GB"
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "checkpoint_timeout=1800s"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+
 
 volumes:
   postgres_data:

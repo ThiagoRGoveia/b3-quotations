@@ -38,7 +38,7 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	return nil
 }
 
-// CreateTradeRecordsTable creates both the staging and final trade_records tables in the database.
+// CreateTradeRecordsTable creates the final trade_records table in the database.
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_records (
@@ -63,33 +63,31 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	return nil
 }
 
-func (m *PostgresDBManager) CreateTradeRecordsStagingTable() error {
-	query := `
-	CREATE UNLOGGED TABLE IF NOT EXISTS trade_records_staging (
-		reference_date TIMESTAMP NOT NULL,
-		transaction_date TIMESTAMP NOT NULL,
-		ticker VARCHAR(255) NOT NULL,
-		identifier VARCHAR(255) NOT NULL,
-		price NUMERIC(18, 2) NOT NULL,
-		quantity BIGINT NOT NULL,
-		closing_time VARCHAR(50) NOT NULL,
-		file_id INTEGER,
-		hash VARCHAR(32) NOT NULL
-	);
-	`
+// ADD: A new function to create a uniquely named UNLOGGED staging table for a worker.
+func (m *PostgresDBManager) CreateWorkerStagingTable(tableName string) error {
+	// We use LIKE to ensure the structure always matches the target table.
+	query := fmt.Sprintf(`CREATE UNLOGGED TABLE IF NOT EXISTS %s (LIKE trade_records INCLUDING DEFAULTS);`, pgx.Identifier{tableName}.Sanitize())
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
-		return fmt.Errorf("error creating trade_records_staging table: %v", err)
+		return fmt.Errorf("error creating worker staging table %s: %v", tableName, err)
 	}
+	return nil
+}
 
+// ADD: A new function to drop the worker's staging table during cleanup.
+func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
+	query := fmt.Sprintf(`DROP TABLE IF EXISTS %s;`, pgx.Identifier{tableName}.Sanitize())
+	_, err := m.dbpool.Exec(context.Background(), query)
+	if err != nil {
+		return fmt.Errorf("error dropping worker staging table %s: %v", tableName, err)
+	}
 	return nil
 }
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 	// Create indexes for the main table that will optimize the NOT EXISTS lookups
 	queries := []string{
-		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (hash)`,
-		`CREATE INDEX IF NOT EXISTS idx_trade_records_ticker_txdate_covering ON trade_records (ticker, transaction_date) INCLUDE (price, quantity)`,
+		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (reference_date, hash)`,
 	}
 
 	for _, query := range queries {
@@ -151,12 +149,12 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors a
 }
 
 // InsertMultipleTrades inserts multiple trade records using the bulk load, filter, and insert pattern.
-func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
-	// Step 1: Bulk load into the staging table for maximum speed
-	log.Println("Bulk loading trades into staging table...")
+func (m *PostgresDBManager) InsertMultipleTrades(ctx context.Context, trades []*models.Trade, stagingTableName string) error {
+	// Step 1: Bulk load into the worker's assigned staging table.
+	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
 	_, err := m.dbpool.CopyFrom(
-		context.Background(),
-		pgx.Identifier{"trade_records_staging"},
+		ctx,
+		pgx.Identifier{stagingTableName}, // Use the passed-in table name.
 		[]string{"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id"},
 		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
 			trade := trades[i]
@@ -165,33 +163,35 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	)
 
 	if err != nil {
-		return fmt.Errorf("unable to copy trades to staging table: %v", err)
+		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
 	}
 
-	// Step 2: Insert by exclusion - only insert records that don't already exist
-	insertQuery := `
+	// Step 2: Insert by exclusion, reading from the worker's assigned staging table.
+	// CRITICAL FIX: The WHERE clause uses the correct composite key for idempotency.
+	insertQuery := fmt.Sprintf(`
 	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
 	SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
-	FROM trade_records_staging s
+	FROM %s s
 	WHERE NOT EXISTS (
 		SELECT 1
 		FROM trade_records t
-		WHERE t.hash = s.hash
+		WHERE t.reference_date = s.reference_date AND t.hash = s.hash
 	);
-	`
+	`, pgx.Identifier{stagingTableName}.Sanitize())
 
-	log.Println("Inserting from staging to main table.")
-	_, err = m.dbpool.Exec(context.Background(), insertQuery)
+	log.Printf("Inserting from staging table %s to main table.", stagingTableName)
+	_, err = m.dbpool.Exec(ctx, insertQuery)
 	if err != nil {
-		return fmt.Errorf("error inserting from staging to main table: %v", err)
+		return fmt.Errorf("error inserting from staging table %s: %v", stagingTableName, err)
 	}
 
-	// Step 3: Truncate the staging table to prepare for the next batch
-	truncateQuery := `TRUNCATE trade_records_staging;`
-	log.Println("Truncate staging table.")
-	_, err = m.dbpool.Exec(context.Background(), truncateQuery)
+	// Step 3: Truncate the worker's staging table to prepare for its *next* batch.
+	truncateQuery := fmt.Sprintf(`TRUNCATE %s;`, pgx.Identifier{stagingTableName}.Sanitize())
+	log.Printf("Truncating staging table %s.", stagingTableName)
+	_, err = m.dbpool.Exec(ctx, truncateQuery)
 	if err != nil {
-		return fmt.Errorf("error truncating staging table: %v", err)
+		// This is not a fatal error for the data itself, but should be logged as a warning.
+		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
 	}
 
 	return nil
