@@ -50,6 +50,9 @@ func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, resu
 func (h *ExtractionHandler) Extract(filesPath string) error {
 	processedFiles := make(map[int]string)
 
+	h.dbManager.CreateFileRecordsTable()
+	h.dbManager.CreateTradeRecordsTable()
+
 	// Start the error worker
 	h.errorWg.Add(1)
 	go h.ErrorWorker()
