@@ -25,7 +25,7 @@ type ExtractionHandler struct {
 	dbBatchSize      int
 	numDBWorkers     int
 
-	fileErrors   map[int][]string
+	fileErrors   map[int][]models.AppError
 	fileErrorsMu sync.Mutex
 }
 
@@ -42,7 +42,7 @@ func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, resu
 		numParserWorkers: numParserWorkers,
 		dbBatchSize:      dbBatchSize,
 		numDBWorkers:     numDBWorkers,
-		fileErrors:       make(map[int][]string),
+		fileErrors:       make(map[int][]models.AppError),
 	}
 }
 
@@ -152,7 +152,7 @@ func (h *ExtractionHandler) ErrorWorker() {
 		// limit the number of errors per file to prevent memory overflow, if more than 100 errors are collected, then file is probably malformed
 		if appErr.FileID != -1 && len(h.fileErrors) < 100 {
 			h.fileErrorsMu.Lock()
-			h.fileErrors[appErr.FileID] = append(h.fileErrors[appErr.FileID], appErr.Error())
+			h.fileErrors[appErr.FileID] = append(h.fileErrors[appErr.FileID], appErr)
 			h.fileErrorsMu.Unlock()
 		} else if appErr.FileID != -1 {
 			// File has too many errors, skip it, and log for manual inspection
@@ -169,13 +169,13 @@ func (h *ExtractionHandler) FileStatusWorker(processedFiles map[int]string) {
 	defer h.fileErrorsMu.Unlock()
 
 	for fileID := range processedFiles {
-		errors := h.fileErrors[fileID]
+		appErrors := h.fileErrors[fileID]
 		status := db.FILE_STATUS_DONE
-		if len(errors) > 0 {
+		if len(appErrors) > 0 {
 			status = db.FILE_STATUS_DONE_WITH_ERRORS
 		}
 
-		if err := h.dbManager.UpdateFileStatus(fileID, status, errors); err != nil {
+		if err := h.dbManager.UpdateFileStatus(fileID, status, appErrors); err != nil {
 			log.Printf("Failed to update status for fileID %d: %v\n", fileID, err)
 		}
 	}

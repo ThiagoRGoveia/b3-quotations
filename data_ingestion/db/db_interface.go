@@ -14,5 +14,5 @@ type DBManager interface {
 	DropTradeRecordIndexes() error
 	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
 	InsertMultipleTrades(trades []*models.Trade) error
-	UpdateFileStatus(fileID int, status string, errors []string) error
+	UpdateFileStatus(fileID int, status string, errors any) error
 }

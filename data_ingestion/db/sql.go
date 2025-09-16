@@ -101,7 +101,7 @@ func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, st
 }
 
 // UpdateFileStatus updates the status of a file record in the database.
-func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors []string) error {
+func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors any) error {
 	query := `
 	UPDATE file_records
 	SET status = $1,
