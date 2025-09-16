@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: trade_postgres_db
+    environment:
+      POSTGRES_USER: tradeuser
+      POSTGRES_PASSWORD: tradepassword
+      POSTGRES_DB: tradedb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  postgres_data:
