@@ -86,10 +86,6 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 	for fileID := range processedFiles {
 		fileIDs = append(fileIDs, fileID)
 	}
-	log.Printf("Transferring data from staging table to final table for files: %v\n", fileIDs)
-	h.dbManager.TransferDataToFinalTable(fileIDs)
-	log.Printf("Cleaning staging table for files: %v\n", fileIDs)
-	h.dbManager.CleanTempData(fileIDs)
 
 	log.Println("Extraction process finished.")
 	return nil

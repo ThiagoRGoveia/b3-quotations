@@ -8,14 +8,11 @@ import (
 
 // DBManager defines the interface for database operations.
 type DBManager interface {
-	CreateFileRecordTable() error
-	CreateTradeLoadedRecordTable() error
+	CreateFileRecordsTable() error
 	CreateTradeRecordsTable() error
+	CreateTradeRecordIndexes() error
+	DropTradeRecordIndexes() error
 	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
-	InsertTrade(trade *models.Trade) (int, error)
 	InsertMultipleTrades(trades []*models.Trade) error
 	UpdateFileStatus(fileID int, status string, errors []string) error
-	ValidateSavedData(fileIDs []int) error
-	TransferDataToFinalTable(fileIDs []int) error
-	CleanTempData(fileIDs []int) error
 }

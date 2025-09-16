@@ -7,6 +7,7 @@ type AppError struct {
 	FileID  int
 	Message string
 	Err     error
+	Trade   *Trade
 }
 
 // Error returns the string representation of the AppError.

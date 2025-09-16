@@ -74,7 +74,12 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors 
 			continue // Skip records that can't be parsed
 		}
 
-		results <- trade
+		// Validate trade record
+		if trade.IsValid() {
+			results <- trade
+		} else {
+			errors <- models.AppError{FileID: fileID, Message: "Invalid trade record", Err: err, Trade: trade}
+		}
 	}
 
 	return nil
