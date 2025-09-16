@@ -168,7 +168,6 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 		return fmt.Errorf("unable to copy trades to staging table: %v", err)
 	}
 
-	log.Println("Copy trades to staging table.")
 	// Step 2: Insert by exclusion - only insert records that don't already exist
 	insertQuery := `
 	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
@@ -181,6 +180,7 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	);
 	`
 
+	log.Println("Inserting from staging to main table.")
 	_, err = m.dbpool.Exec(context.Background(), insertQuery)
 	if err != nil {
 		return fmt.Errorf("error inserting from staging to main table: %v", err)

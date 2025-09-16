@@ -10,6 +10,7 @@ import (
 type DBManager interface {
 	CreateFileRecordsTable() error
 	CreateTradeRecordsTable() error
+	CreateTradeRecordsStagingTable() error
 	CreateTradeRecordIndexes() error
 	DropTradeRecordIndexes() error
 	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
