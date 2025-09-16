@@ -24,7 +24,6 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	CREATE TABLE IF NOT EXISTS file_records (
 		id SERIAL PRIMARY KEY,
 		file_name VARCHAR(255) NOT NULL,
-		reference_date TIMESTAMP NOT NULL,
 		processed_at TIMESTAMP NOT NULL,
 		status VARCHAR(50) NOT NULL CHECK (status IN ('DONE', 'DONE_WITH_ERRORS', 'PROCESSING', 'FATAL')),
 		errors jsonb
@@ -89,7 +88,7 @@ func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 // InsertFileRecord inserts a new file record into the file_records table.
 func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, status string) (int, error) {
 	query := `
-	INSERT INTO file_records (file_name, reference_date, status)
+	INSERT INTO file_records (file_name, processed_at, status)
 	VALUES ($1, $2, $3)
 	RETURNING id;`
 
