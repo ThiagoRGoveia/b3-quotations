@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/db"
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/handlers"
@@ -12,11 +13,14 @@ import (
 )
 
 const (
-	numParserWorkers = 7
-	numDBWorkers     = 7
+	numParserWorkers   = 7
+	numDBWorkers       = 14
+	resultsChannelSize = 500000
+	dbBatchSize        = 80000
 )
 
 func main() {
+	startTime := time.Now()
 	if len(os.Args) < 2 {
 		log.Fatal("Please provide the folder path as a command-line argument.")
 	}
@@ -35,21 +39,13 @@ func main() {
 	defer dbpool.Close()
 
 	jobs := make(chan models.FileJob, 100)
-	results := make(chan *models.Trade, 20000)
+	results := make(chan *models.Trade, resultsChannelSize)
 	errors := make(chan models.AppError, 100)
 	var parserWg, dbWg, errorWg sync.WaitGroup
-	dbBatchSize := 10000
 
 	dbManager := db.NewPostgresDBManager(dbpool)
 
-	if err := dbManager.CreateFileRecordTable(); err != nil {
-		log.Fatalf("Unable to create file_records table: %v\n", err)
-	}
-	if err := dbManager.CreateTradeLoadedRecordTable(); err != nil {
-		log.Fatalf("Unable to create trade_loaded_records table: %v\n", err)
-	}
-
-	handler := handlers.NewExtractionHandler(dbManager, jobs, results, errors, &parserWg, &dbWg, &errorWg, numParserWorkers, dbBatchSize, numDBWorkers)
+	handler := handlers.NewExtractionHandler(dbManager, jobs, results, errors, &parserWg, &dbWg, &errorWg, numParserWorkers, numDBWorkers, dbBatchSize)
 
 	err = handler.Extract(filesPath)
 	if err != nil {
@@ -58,4 +54,5 @@ func main() {
 	}
 
 	log.Println("Extraction process finished.")
+	log.Printf("Execution time: %s\n", time.Since(startTime))
 }

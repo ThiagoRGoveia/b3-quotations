@@ -10,12 +10,11 @@ type Trade struct {
 	QuantidadeNegociada int64     `json:"quantidade_negociada,omitempty"`
 	HoraFechamento      string    `json:"hora_fechamento,omitempty"`
 	FileID              int       `json:"file_id,omitempty"`
+	Hash                string    `json:"hash,omitempty"`
 }
 
 func (t *Trade) IsValid() bool {
 	return t.DataNegocio != time.Time{} &&
 		t.CodigoInstrumento != "" &&
-		t.PrecoNegocio != 0 &&
-		t.QuantidadeNegociada != 0 &&
 		t.HoraFechamento != ""
 }

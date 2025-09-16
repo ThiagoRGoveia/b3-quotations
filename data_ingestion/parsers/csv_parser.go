@@ -2,6 +2,7 @@ package parsers
 
 import (
 	"encoding/csv"
+	"encoding/hex"
 	"io"
 	"os"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
+	"github.com/cespare/xxhash/v2"
 )
 
 // parseRecord parses a single CSV record into a Trade struct.
@@ -68,11 +70,17 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors 
 			continue // Skip corrupted records
 		}
 
+		// Calculate MD5 hash of the raw CSV line
+		lineHash := calculateHash(record)
+
 		trade, err := parseRecord(record, fileID)
 		if err != nil {
 			errors <- models.AppError{FileID: fileID, Message: "Failed to parse record", Err: err}
 			continue // Skip records that can't be parsed
 		}
+
+		// Set the hash in the trade record
+		trade.Hash = lineHash
 
 		// Validate trade record
 		if trade.IsValid() {
@@ -83,4 +91,17 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors 
 	}
 
 	return nil
+}
+
+// calculateHash generates an MD5 hash for a CSV record
+func calculateHash(record []string) string {
+	// Use strings.Join for efficient concatenation.
+	lineContent := strings.Join(record, ";")
+
+	// Create xxHash hash
+	digest := xxhash.New()
+	digest.Write([]byte(lineContent))
+
+	// Convert to hex string
+	return hex.EncodeToString(digest.Sum(nil))
 }

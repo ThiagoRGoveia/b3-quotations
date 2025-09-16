@@ -40,17 +40,17 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 // CreateTradeRecordsTable creates the trade_records table in the database.
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
-	CREATE TABLE IF NOT EXISTS trade_records (
+CREATE TABLE IF NOT EXISTS trade_records (
 		id SERIAL PRIMARY KEY,
-		data_negocio TIMESTAMP NOT NULL,
-		codigo_instrumento VARCHAR(255) NOT NULL,
-		preco_negocio NUMERIC(18, 2) NOT NULL,
-		quantidade_negociada BIGINT NOT NULL,
-		hora_fechamento VARCHAR(50) NOT NULL,
-		file_id INTEGER,
-		FOREIGN KEY (file_id) REFERENCES file_records(id)
-	);
-	`
+    data_negocio TIMESTAMP NOT NULL,
+    codigo_instrumento VARCHAR(255) NOT NULL,
+    preco_negocio NUMERIC(18, 2) NOT NULL,
+    quantidade_negociada BIGINT NOT NULL,
+    hora_fechamento VARCHAR(50) NOT NULL,
+    file_id INTEGER,
+		hash VARCHAR(32) NOT NULL UNIQUE,
+    FOREIGN KEY (file_id) REFERENCES file_records(id),
+);`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
@@ -120,11 +120,11 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors [
 func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	_, err := m.dbpool.CopyFrom(
 		context.Background(),
-		pgx.Identifier{"trade_loaded_records"},
-		[]string{"data_negocio", "codigo_instrumento", "preco_negocio", "quantidade_negociada", "hora_fechamento", "file_id"},
+		pgx.Identifier{"trade_records"},
+		[]string{"hash", "data_negocio", "codigo_instrumento", "preco_negocio", "quantidade_negociada", "hora_fechamento", "file_id"},
 		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
 			trade := trades[i]
-			return []any{trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, trade.FileID}, nil
+			return []any{trade.Hash, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, trade.FileID}, nil
 		}),
 	)
 

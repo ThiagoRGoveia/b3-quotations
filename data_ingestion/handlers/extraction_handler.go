@@ -30,7 +30,7 @@ type ExtractionHandler struct {
 }
 
 // NewExtractionHandler creates a new ExtractionHandler.
-func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, errors chan models.AppError, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, errorWg *sync.WaitGroup, numParserWorkers int, dbBatchSize int, numDBWorkers int) *ExtractionHandler {
+func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, errors chan models.AppError, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, errorWg *sync.WaitGroup, numParserWorkers int, numDBWorkers int, dbBatchSize int) *ExtractionHandler {
 	return &ExtractionHandler{
 		dbManager:        dbManager,
 		jobs:             jobs,
@@ -63,7 +63,7 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 	// Start DB workers
 	for w := 1; w <= h.numDBWorkers; w++ {
 		h.dbWg.Add(1)
-		go h.DBWorker()
+		go h.DBWorker(w)
 	}
 
 	// Goroutine to scan directory and send jobs
@@ -81,11 +81,6 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 
 	// Wait for the error and status workers to finish
 	h.errorWg.Wait()
-
-	fileIDs := make([]int, 0, len(processedFiles))
-	for fileID := range processedFiles {
-		fileIDs = append(fileIDs, fileID)
-	}
 
 	log.Println("Extraction process finished.")
 	return nil
@@ -105,13 +100,14 @@ func (h *ExtractionHandler) ParserWorker() {
 }
 
 // DBWorker processes trades from a channel and inserts them into the database in batches.
-func (h *ExtractionHandler) DBWorker() {
+func (h *ExtractionHandler) DBWorker(workerId int) {
 	defer h.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.dbBatchSize)
 
 	for result := range h.results {
 		trades = append(trades, result)
 		if len(trades) >= h.dbBatchSize {
+			log.Printf("DB Worker %d: Inserting batch of %d trades\n", workerId, len(trades))
 			err := h.dbManager.InsertMultipleTrades(trades)
 			if err != nil {
 				// The batch failed, so report an error for each unique FileID in the batch.
