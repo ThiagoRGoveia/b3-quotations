@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
@@ -76,7 +77,6 @@ func (m *PostgresDBManager) CreateTradeRecordsStagingTable() error {
 		hash VARCHAR(32) NOT NULL
 	);
 	`
-
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
 		return fmt.Errorf("error creating trade_records_staging table: %v", err)
@@ -89,6 +89,7 @@ func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 	// Create indexes for the main table that will optimize the NOT EXISTS lookups
 	queries := []string{
 		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_trade_records_ticker_txdate_covering ON trade_records (ticker, transaction_date) INCLUDE (price, quantity)`,
 	}
 
 	for _, query := range queries {
@@ -103,9 +104,8 @@ func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 
 func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 	queries := []string{
-		`DROP INDEX IF EXISTS idx_trade_records_covering`,
 		`DROP INDEX IF EXISTS idx_trade_records_hash`,
-		`DROP INDEX IF EXISTS idx_trade_records_ticker_date_hash`,
+		`DROP INDEX IF EXISTS idx_trade_records_ticker_txdate_covering`,
 	}
 
 	for _, query := range queries {
@@ -153,6 +153,7 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors a
 // InsertMultipleTrades inserts multiple trade records using the bulk load, filter, and insert pattern.
 func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	// Step 1: Bulk load into the staging table for maximum speed
+	log.Println("Bulk loading trades into staging table...")
 	_, err := m.dbpool.CopyFrom(
 		context.Background(),
 		pgx.Identifier{"trade_records_staging"},
@@ -167,6 +168,7 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 		return fmt.Errorf("unable to copy trades to staging table: %v", err)
 	}
 
+	log.Println("Copy trades to staging table.")
 	// Step 2: Insert by exclusion - only insert records that don't already exist
 	insertQuery := `
 	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
@@ -186,6 +188,7 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 
 	// Step 3: Truncate the staging table to prepare for the next batch
 	truncateQuery := `TRUNCATE trade_records_staging;`
+	log.Println("Truncate staging table.")
 	_, err = m.dbpool.Exec(context.Background(), truncateQuery)
 	if err != nil {
 		return fmt.Errorf("error truncating staging table: %v", err)
