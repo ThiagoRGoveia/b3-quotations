@@ -24,7 +24,8 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	CREATE TABLE IF NOT EXISTS file_records (
 		id SERIAL PRIMARY KEY,
 		file_name VARCHAR(255) NOT NULL,
-		date TIMESTAMP NOT NULL,
+		reference_date TIMESTAMP NOT NULL,
+		processed_at TIMESTAMP NOT NULL,
 		status VARCHAR(50) NOT NULL CHECK (status IN ('DONE', 'DONE_WITH_ERRORS', 'PROCESSING', 'FATAL')),
 		errors jsonb
 	);`
@@ -40,16 +41,17 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 // CreateTradeRecordsTable creates the trade_records table in the database.
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
-CREATE TABLE IF NOT EXISTS trade_records (
+		CREATE TABLE IF NOT EXISTS trade_records (
 		id SERIAL PRIMARY KEY,
-    data_negocio TIMESTAMP NOT NULL,
-    codigo_instrumento VARCHAR(255) NOT NULL,
-    preco_negocio NUMERIC(18, 2) NOT NULL,
-    quantidade_negociada BIGINT NOT NULL,
-    hora_fechamento VARCHAR(50) NOT NULL,
+		reference_date TIMESTAMP NOT NULL,
+    transaction_date TIMESTAMP NOT NULL,
+    ticker VARCHAR(255) NOT NULL,
+		identifier VARCHAR(255) NOT NULL,
+    price NUMERIC(18, 2) NOT NULL,
+    quantity BIGINT NOT NULL,
+    closing_time VARCHAR(50) NOT NULL,
     file_id INTEGER,
-		hash VARCHAR(32) NOT NULL UNIQUE,
-    FOREIGN KEY (file_id) REFERENCES file_records(id),
+		hash VARCHAR(32) NOT NULL
 );`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
@@ -62,7 +64,7 @@ CREATE TABLE IF NOT EXISTS trade_records (
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 	query := `
-	CREATE INDEX idx_trade_records_covering ON trade_records (codigo_instrumento, data_negocio, preco_negocio, quantidade_negociada);`
+	CREATE INDEX idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
@@ -87,7 +89,7 @@ func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 // InsertFileRecord inserts a new file record into the file_records table.
 func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, status string) (int, error) {
 	query := `
-	INSERT INTO file_records (file_name, date, status)
+	INSERT INTO file_records (file_name, reference_date, status)
 	VALUES ($1, $2, $3)
 	RETURNING id;`
 
@@ -121,10 +123,10 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	_, err := m.dbpool.CopyFrom(
 		context.Background(),
 		pgx.Identifier{"trade_records"},
-		[]string{"hash", "data_negocio", "codigo_instrumento", "preco_negocio", "quantidade_negociada", "hora_fechamento", "file_id"},
+		[]string{"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id"},
 		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
 			trade := trades[i]
-			return []any{trade.Hash, trade.DataNegocio, trade.CodigoInstrumento, trade.PrecoNegocio, trade.QuantidadeNegociada, trade.HoraFechamento, trade.FileID}, nil
+			return []any{trade.Hash, trade.ReferenceDate, trade.TransactionDate, trade.Ticker, trade.Identifier, trade.Price, trade.Quantity, trade.ClosingTime, trade.FileID}, nil
 		}),
 	)
 

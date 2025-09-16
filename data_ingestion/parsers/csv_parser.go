@@ -3,6 +3,7 @@ package parsers
 import (
 	"encoding/csv"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"strconv"
@@ -27,18 +28,31 @@ func parseRecord(record []string, fileID int) (*models.Trade, error) {
 		return nil, err
 	}
 
+	if record[8] == "" {
+		return nil, fmt.Errorf("empty date")
+	}
+
+	dataReferencia, err := time.Parse("2006-01-02", record[0])
+	if err != nil {
+		return nil, err
+	}
+
 	dataNegocio, err := time.Parse("2006-01-02", record[8])
 	if err != nil {
 		return nil, err
 	}
 
+	codigoIdentificadorNegocio := record[6]
+
 	return &models.Trade{
-		FileID:              fileID,
-		CodigoInstrumento:   record[1],
-		PrecoNegocio:        precoNegocio,
-		QuantidadeNegociada: quantidadeNegociada,
-		HoraFechamento:      record[5],
-		DataNegocio:         dataNegocio,
+		FileID:          fileID,
+		ReferenceDate:   dataReferencia,
+		Ticker:          record[1],
+		Price:           precoNegocio,
+		Quantity:        quantidadeNegociada,
+		ClosingTime:     record[5],
+		TransactionDate: dataNegocio,
+		Identifier:      codigoIdentificadorNegocio,
 	}, nil
 }
 
