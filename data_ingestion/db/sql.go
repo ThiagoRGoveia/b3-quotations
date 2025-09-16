@@ -37,21 +37,22 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	return nil
 }
 
-// CreateTradeRecordsTable creates the trade_records table in the database.
+// CreateTradeRecordsTable creates both the staging and final trade_records tables in the database.
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
-		CREATE TABLE IF NOT EXISTS trade_records (
+	CREATE TABLE IF NOT EXISTS trade_records (
 		id SERIAL PRIMARY KEY,
 		reference_date TIMESTAMP NOT NULL,
-    transaction_date TIMESTAMP NOT NULL,
-    ticker VARCHAR(255) NOT NULL,
+		transaction_date TIMESTAMP NOT NULL,
+		ticker VARCHAR(255) NOT NULL,
 		identifier VARCHAR(255) NOT NULL,
-    price NUMERIC(18, 2) NOT NULL,
-    quantity BIGINT NOT NULL,
-    closing_time VARCHAR(50) NOT NULL,
-    file_id INTEGER,
+		price NUMERIC(18, 2) NOT NULL,
+		quantity BIGINT NOT NULL,
+		closing_time VARCHAR(50) NOT NULL,
+		file_id INTEGER,
 		hash VARCHAR(32) NOT NULL
-);`
+	);
+	`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
@@ -61,25 +62,57 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	return nil
 }
 
-func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
+func (m *PostgresDBManager) CreateTradeRecordsStagingTable() error {
 	query := `
-	CREATE INDEX idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`
+	CREATE UNLOGGED TABLE IF NOT EXISTS trade_records_staging (
+		reference_date TIMESTAMP NOT NULL,
+		transaction_date TIMESTAMP NOT NULL,
+		ticker VARCHAR(255) NOT NULL,
+		identifier VARCHAR(255) NOT NULL,
+		price NUMERIC(18, 2) NOT NULL,
+		quantity BIGINT NOT NULL,
+		closing_time VARCHAR(50) NOT NULL,
+		file_id INTEGER,
+		hash VARCHAR(32) NOT NULL
+	);
+	`
 
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
-		return fmt.Errorf("error creating index: %v", err)
+		return fmt.Errorf("error creating trade_records_staging table: %v", err)
+	}
+
+	return nil
+}
+
+func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
+	// Create indexes for the main table that will optimize the NOT EXISTS lookups
+	queries := []string{
+		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (hash)`,
+	}
+
+	for _, query := range queries {
+		_, err := m.dbpool.Exec(context.Background(), query)
+		if err != nil {
+			return fmt.Errorf("error creating index: %v", err)
+		}
 	}
 
 	return nil
 }
 
 func (m *PostgresDBManager) DropTradeRecordIndexes() error {
-	query := `
-	DROP INDEX idx_trade_records_covering;`
+	queries := []string{
+		`DROP INDEX IF EXISTS idx_trade_records_covering`,
+		`DROP INDEX IF EXISTS idx_trade_records_hash`,
+		`DROP INDEX IF EXISTS idx_trade_records_ticker_date_hash`,
+	}
 
-	_, err := m.dbpool.Exec(context.Background(), query)
-	if err != nil {
-		return fmt.Errorf("error dropping index: %v", err)
+	for _, query := range queries {
+		_, err := m.dbpool.Exec(context.Background(), query)
+		if err != nil {
+			return fmt.Errorf("error dropping index: %v", err)
+		}
 	}
 
 	return nil
@@ -117,11 +150,12 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors a
 	return nil
 }
 
-// InsertMultipleTrades inserts multiple trade records in a single transaction.
+// InsertMultipleTrades inserts multiple trade records using the bulk load, filter, and insert pattern.
 func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
+	// Step 1: Bulk load into the staging table for maximum speed
 	_, err := m.dbpool.CopyFrom(
 		context.Background(),
-		pgx.Identifier{"trade_records"},
+		pgx.Identifier{"trade_records_staging"},
 		[]string{"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id"},
 		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
 			trade := trades[i]
@@ -130,7 +164,31 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade) error {
 	)
 
 	if err != nil {
-		return fmt.Errorf("unable to copy trades from slice: %v", err)
+		return fmt.Errorf("unable to copy trades to staging table: %v", err)
+	}
+
+	// Step 2: Insert by exclusion - only insert records that don't already exist
+	insertQuery := `
+	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
+	SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
+	FROM trade_records_staging s
+	WHERE NOT EXISTS (
+		SELECT 1
+		FROM trade_records t
+		WHERE t.hash = s.hash
+	);
+	`
+
+	_, err = m.dbpool.Exec(context.Background(), insertQuery)
+	if err != nil {
+		return fmt.Errorf("error inserting from staging to main table: %v", err)
+	}
+
+	// Step 3: Truncate the staging table to prepare for the next batch
+	truncateQuery := `TRUNCATE trade_records_staging;`
+	_, err = m.dbpool.Exec(context.Background(), truncateQuery)
+	if err != nil {
+		return fmt.Errorf("error truncating staging table: %v", err)
 	}
 
 	return nil

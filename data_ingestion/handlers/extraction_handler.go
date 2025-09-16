@@ -52,6 +52,7 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
+	h.dbManager.CreateTradeRecordIndexes()
 
 	// Start the error worker
 	h.errorWg.Add(1)
