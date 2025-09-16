@@ -11,11 +11,12 @@ import (
 type DBManager interface {
 	CreateFileRecordsTable() error
 	CreateTradeRecordsTable() error
-	CreateTradeRecordIndexes() error
 	DropTradeRecordIndexes() error
 	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
 	UpdateFileStatus(fileID int, status string, errors any) error
 	CreateWorkerStagingTable(tableName string) error
 	DropWorkerStagingTable(tableName string) error
 	InsertMultipleTrades(ctx context.Context, trades []*models.Trade, stagingTableName string) error
+	CheckIfPartitionExists(ctx context.Context, date time.Time) (bool, error)
+	CreatePartitionForDate(ctx context.Context, date time.Time) error
 }

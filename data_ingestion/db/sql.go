@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
@@ -38,11 +39,11 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	return nil
 }
 
-// CreateTradeRecordsTable creates the final trade_records table in the database.
+// CreateTradeRecordsTable creates the final trade_records parent partition table.
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_records (
-		id SERIAL PRIMARY KEY,
+		id BIGSERIAL NOT NULL, 
 		reference_date TIMESTAMP NOT NULL,
 		transaction_date TIMESTAMP NOT NULL,
 		ticker VARCHAR(255) NOT NULL,
@@ -52,12 +53,14 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 		closing_time VARCHAR(50) NOT NULL,
 		file_id INTEGER,
 		hash VARCHAR(32) NOT NULL
-	);
+	) PARTITION BY RANGE (reference_date); 
 	`
+	// Note: We intentionally avoid creating global unique indexes (like PRIMARY KEY)
+	// on the parent table. Uniqueness (reference_date, hash) will be enforced on child partitions.
 
 	_, err := m.dbpool.Exec(context.Background(), query)
 	if err != nil {
-		return fmt.Errorf("error creating trade_records table: %v", err)
+		return fmt.Errorf("error creating trade_records partition table: %v", err)
 	}
 
 	return nil
@@ -85,8 +88,10 @@ func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
 }
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
-	// Create indexes for the main table that will optimize the NOT EXISTS lookups
+	// Create index on the parent table. This index will be automatically
+	// created on all child partitions, optimizing the WHERE NOT EXISTS lookup.
 	queries := []string{
+		// Note: B-Tree index on a partitioned table is automatically a partitioned index.
 		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (reference_date, hash)`,
 	}
 
@@ -114,6 +119,82 @@ func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 	}
 
 	return nil
+}
+
+// getPartitionTableName generates a consistent partition name for a given date.
+func getPartitionTableName(date time.Time) string {
+	// Format: trade_records_YYYYMMDD
+	return fmt.Sprintf("trade_records_%s", date.Format("20060102"))
+}
+
+// CheckIfPartitionExists checks if a partition for the given date already exists.
+func (m *PostgresDBManager) CheckIfPartitionExists(ctx context.Context, date time.Time) (bool, error) {
+	tableName := getPartitionTableName(date)
+
+	query := `
+	SELECT 1
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.relname = $1
+	AND n.nspname = 'public'; -- Assuming the table is in the public schema
+
+	`
+	var exists int
+	err := m.dbpool.QueryRow(ctx, query, tableName).Scan(&exists)
+
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("error checking partition existence for %s: %w", tableName, err)
+	}
+	return true, nil
+}
+
+// CreatePartitionForDate creates a partition for a specific day if it doesn't exist.
+// This function assumes the input date is normalized (e.g., midnight UTC).
+func (m *PostgresDBManager) CreatePartitionForDate(ctx context.Context, date time.Time) error {
+	tableName := getPartitionTableName(date)
+
+	// Calculate range: [date_midnight, next_day_midnight)
+	startRange := date.Format("2006-01-02 15:04:05")
+	endRange := date.Add(24 * time.Hour).Format("2006-01-02 15:04:05")
+	createQuery := fmt.Sprintf(`
+	CREATE TABLE %s PARTITION OF trade_records
+	FOR VALUES FROM ('%s') TO ('%s');
+	`, pgx.Identifier{tableName}.Sanitize(), startRange, endRange)
+
+	log.Printf("Creating partition %s for range [%s, %s)", tableName, startRange, endRange)
+
+	_, err := m.dbpool.Exec(ctx, createQuery)
+	if err != nil {
+		if !m.isPartitionAlreadyExistsError(err) {
+			return fmt.Errorf("error creating partition %s: %w", tableName, err)
+		}
+		log.Printf("Partition %s already exists, skipping creation.", tableName)
+		return nil // Already exists, not an error
+	}
+
+	indexName := "idx_unique_" + tableName
+	indexQuery := fmt.Sprintf(`
+		CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (reference_date, hash);
+	`, pgx.Identifier{indexName}.Sanitize(), pgx.Identifier{tableName}.Sanitize())
+
+	log.Printf("Applying unique index %s to partition %s", indexName, tableName)
+	_, err = m.dbpool.Exec(ctx, indexQuery)
+	if err != nil {
+		if !m.isPartitionAlreadyExistsError(err) {
+			return fmt.Errorf("error applying unique index to partition %s: %w", tableName, err)
+		}
+		log.Printf("Unique index on partition %s already exists.", tableName)
+	}
+
+	return nil
+}
+
+func (m *PostgresDBManager) isPartitionAlreadyExistsError(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "already exists") || strings.Contains(errStr, "duplicate key value violates unique constraint")
 }
 
 // InsertFileRecord inserts a new file record into the file_records table.
@@ -167,7 +248,6 @@ func (m *PostgresDBManager) InsertMultipleTrades(ctx context.Context, trades []*
 	}
 
 	// Step 2: Insert by exclusion, reading from the worker's assigned staging table.
-	// CRITICAL FIX: The WHERE clause uses the correct composite key for idempotency.
 	insertQuery := fmt.Sprintf(`
 	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
 	SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id

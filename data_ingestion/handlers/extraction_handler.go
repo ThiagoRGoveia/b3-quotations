@@ -52,45 +52,61 @@ func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, resu
 func (h *ExtractionHandler) Extract(filesPath string) error {
 	processedFiles := make(map[int]string)
 
+	// Setup database tables
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
-	h.dbManager.CreateTradeRecordIndexes()
 
-	// Start the error worker
-	h.errorWg.Add(1)
-	go h.ErrorWorker()
-
-	// Start parser workers
-	for w := 1; w <= h.numParserWorkers; w++ {
-		h.parserWg.Add(1)
-		go h.ParserWorker()
+	// Step 1: Synchronously build a set of all reference dates needed and get file paths.
+	log.Println("Scanning files to determine required partitions...")
+	uniqueDates, filePaths, err := h.buildDatesSetAndFiles(filesPath)
+	if err != nil {
+		log.Fatalf("Failed to scan files and build date set: %v", err)
 	}
+	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
 
-	// CHANGE: Create a unique staging table for each DB worker before it starts.
+	// Step 2: Synchronously create all required partitions before processing starts.
+	ctx := context.Background()
+	for date := range uniqueDates {
+		if err := h.dbManager.CreatePartitionForDate(ctx, date); err != nil {
+			// If partition creation fails, it's a fatal error as ingestion will fail.
+			log.Fatalf("Failed to create partition for date %s: %v", date.Format("2006-01-02"), err)
+		}
+	}
+	log.Println("All necessary partitions are ready.")
+
+	// Step 3: Create staging tables for each DB worker.
+	// The deferred drop must be in this scope to prevent premature cleanup.
 	for w := 1; w <= h.numDBWorkers; w++ {
 		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
-
-		// Create the table for the worker.
 		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
-			// This is a fatal startup error, we cannot proceed.
-			return fmt.Errorf("failed to create staging table for worker %d: %w", w, err)
+			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
 		}
-
-		// DEFER the dropping of the table. This ensures cleanup even if the application panics.
+		// Defer the drop until the entire Extract function completes.
 		defer func(tableName string) {
 			log.Printf("Cleaning up staging table %s", tableName)
 			h.dbManager.DropWorkerStagingTable(tableName)
 		}(stagingTableName)
-
-		// Start the DB worker and pass its unique table name.
-		h.dbWg.Add(1)
-		go h.DBWorker(w, stagingTableName)
 	}
 
-	// Goroutine to scan directory and send jobs
-	h.DirectoryWorker(filesPath, processedFiles)
+	// Step 4: Start all worker pools.
+	h.startWorkers()
 
-	// Wait for all parsing and DB jobs to finish, then close the error channel
+	// Step 4: Dispatch jobs for each file.
+	log.Println("Dispatching file processing jobs...")
+	for _, path := range filePaths {
+		// Synchronously create file record and get ID
+		fileID, err := h.dbManager.InsertFileRecord(path, time.Now(), db.FILE_STATUS_PROCESSING)
+		if err != nil {
+			log.Printf("Error inserting file record for %s: %v\n", path, err)
+			continue // Continue to next file
+		}
+		processedFiles[fileID] = path
+		h.jobs <- models.FileJob{FilePath: path, FileID: fileID}
+	}
+	close(h.jobs) // All jobs have been sent
+
+	// Step 5: Wait for all processing to complete.
+	log.Println("Waiting for all workers to finish...")
 	h.parserWg.Wait()
 	close(h.results)
 	h.dbWg.Wait()
@@ -206,7 +222,76 @@ func (h *ExtractionHandler) FileStatusWorker(processedFiles map[int]string) {
 	}
 }
 
-func (h *ExtractionHandler) DirectoryWorker(filesPath string, processedFiles map[int]string) {
+// buildDatesSetAndFiles walks the directory, gets all file paths, and extracts the unique reference dates from them.
+func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) (map[time.Time]struct{}, []string, error) {
+	uniqueDates := make(map[time.Time]struct{})
+	var filePaths []string
+
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err // Propagate errors from walking the path
+		}
+		if !info.IsDir() {
+			// Get the reference date from the file
+			refDate, err := parsers.GetReferenceDateFromFile(path)
+			if err != nil {
+				log.Printf("WARN: Could not get reference date from file %s: %v. Skipping file.", path, err)
+				return nil // Skip this file, but continue walking
+			}
+
+			// Normalize the date to midnight for consistency
+			normalizedDate := refDate.Truncate(24 * time.Hour)
+			uniqueDates[normalizedDate] = struct{}{}
+			filePaths = append(filePaths, path)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("error walking directory %s: %w", rootPath, err)
+	}
+
+	return uniqueDates, filePaths, nil
+}
+
+// startWorkers initializes and starts all the worker pools (parser, DB, error).
+func (h *ExtractionHandler) setupAndDeferStagingTableCleanup() {
+	for w := 1; w <= h.numDBWorkers; w++ {
+		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
+		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
+			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
+		}
+		// Defer the drop until the entire Extract function completes.
+		defer func(tableName string) {
+			log.Printf("Cleaning up staging table %s", tableName)
+			h.dbManager.DropWorkerStagingTable(tableName)
+		}(stagingTableName)
+	}
+}
+
+// startWorkers initializes and starts all the worker pools (parser, DB, error).
+func (h *ExtractionHandler) startWorkers() {
+	// Start the error worker
+	h.errorWg.Add(1)
+	go h.ErrorWorker()
+
+	// Start parser workers
+	for w := 1; w <= h.numParserWorkers; w++ {
+		h.parserWg.Add(1)
+		go h.ParserWorker()
+	}
+
+	// Start DB workers
+	for w := 1; w <= h.numDBWorkers; w++ {
+		workerId := w
+		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
+		// The staging table is already created in the Extract method.
+		h.dbWg.Add(1)
+		go h.DBWorker(w, stagingTableName)
+	}
+}
+
+func (h *ExtractionHandler) WalkDirectory(filesPath string, processedFiles map[int]string) {
 
 	defer close(h.jobs)
 
