@@ -10,6 +10,7 @@ import (
 type DBManager interface {
 	CreateFileRecordsTable() error
 	CreateTradeRecordsTable() error
+	CreateTradeRecordIndexes() error
 	DropTradeRecordIndexes() error
 	InsertFileRecord(fileName string, date time.Time, status string, checksum string, referenceDate time.Time) (int, error)
 	UpdateFileChecksum(fileID int, checksum string) error
@@ -17,12 +18,10 @@ type DBManager interface {
 	CreateWorkerStagingTable(tableName string) error
 	CreateWorkerStagingTables(numTables int) ([]string, error)
 	DropWorkerStagingTable(tableName string) error
-	InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error
 	CheckIfPartitionExists(date time.Time) (bool, error)
 	CreatePartitionForDate(date time.Time) error
 	CreatePartitionsForDates(dates []time.Time) (*FirstWritePartition, error)
 	InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error
 	InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error
-	CopyTradesIntoStagingTable(trades []*models.Trade, stagingTableName string) error
-	FindFileRecordByChecksum(checksum string) (*models.FileRecord, error)
+	IsFileAlreadyProcessed(checksum string) (bool, error)
 }

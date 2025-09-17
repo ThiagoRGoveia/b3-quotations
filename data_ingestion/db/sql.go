@@ -189,11 +189,9 @@ func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
 }
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
-	// Create index on the parent table. This index will be automatically
-	// created on all child partitions, optimizing the WHERE NOT EXISTS lookup.
 	queries := []string{
-		// Note: B-Tree index on a partitioned table is automatically a partitioned index.
 		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (reference_date, hash)`,
+		`CREATE INDEX idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`,
 	}
 
 	for _, query := range queries {
@@ -308,10 +306,14 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 	// Generate all the table names first
 	tableNames := make([]string, 0, len(dates))
 	dateToTableName := make(map[time.Time]string, len(dates))
+	createdPartitions := make(FirstWritePartition)
+
 	for _, date := range dates {
 		tableName := getPartitionTableName(date)
 		tableNames = append(tableNames, tableName)
 		dateToTableName[date] = tableName
+		// populate map with all dates being processed
+		createdPartitions[date] = true
 	}
 
 	// Begin a transaction
@@ -397,6 +399,8 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 				log.Printf("Partition %s already exists, skipping creation.", tableName)
 			}
 		} else {
+			// if the partition already exists, it is not the first write
+			createdPartitions[date] = false
 			log.Printf("Partition for date %s already exists. Skipping creation.", date.Format("2006-01-02"))
 		}
 	}
@@ -406,11 +410,6 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 		return nil, fmt.Errorf("error committing transaction: %v", err)
 	}
 
-	// return created partition dates
-	createdPartitions := make(FirstWritePartition)
-	for _, date := range dates {
-		createdPartitions[date] = true
-	}
 	return &createdPartitions, nil
 }
 
@@ -461,106 +460,62 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors a
 	return nil
 }
 
-// FindFileRecordByChecksum finds a file record by its checksum.
-func (m *PostgresDBManager) FindFileRecordByChecksum(checksum string) (*models.FileRecord, error) {
+// IsFileAlreadyProcessed finds a file record by its checksum.
+func (m *PostgresDBManager) IsFileAlreadyProcessed(checksum string) (bool, error) {
 	query := `
-	SELECT id, file_name, processed_at, status, checksum, reference_date, errors
+	SELECT id
 	FROM file_records
 	WHERE checksum = $1;`
 
-	fileRecord := &models.FileRecord{}
-	var errors []byte // Use a byte slice for the JSON field
+	var id int
 
-	err := m.dbpool.QueryRow(m.ctx, query, checksum).Scan(
-		&fileRecord.ID,
-		&fileRecord.FileName,
-		&fileRecord.ProcessedAt,
-		&fileRecord.Status,
-		&fileRecord.Checksum,
-		&fileRecord.ReferenceDate,
-		&errors,
-	)
+	err := m.dbpool.QueryRow(m.ctx, query, checksum).Scan(&id)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return nil, nil // Not found, but not an error
+			return false, nil // Not found, but not an error
 		}
-		return nil, fmt.Errorf("error finding file record by checksum: %v", err)
+		return false, fmt.Errorf("error finding file record by checksum: %v", err)
 	}
 
-	// Only set errors if not null
-	if errors != nil {
-		fileRecord.Errors = errors
-	}
-
-	return fileRecord, nil
+	return true, nil
 }
 
-func (m *PostgresDBManager) CopyTradesIntoStagingTable(trades []*models.Trade, stagingTableName string) error {
+func (m *PostgresDBManager) CopyTradesIntoStagingTable(tx pgx.Tx, trades []*models.Trade, stagingTableName string) error {
+	// The column order here must match the order in the `trade_records` table.
+	columnNames := []string{
+		"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id",
+	}
 
-	// Step 1: Bulk load into the worker's assigned staging table.
-	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
-	_, err := m.dbpool.CopyFrom(
+	// The copy source is an iterator that reads from our slice of trades.
+	copySource := pgx.CopyFromSlice(len(trades), func(i int) ([]interface{}, error) {
+		trade := trades[i]
+		return []interface{}{trade.Hash, trade.ReferenceDate, trade.TransactionDate, trade.Ticker, trade.Identifier, trade.Price, trade.Quantity, trade.ClosingTime, trade.FileID},
+			nil
+	})
+
+	// Perform the bulk insert.
+	_, err := tx.CopyFrom(
 		m.ctx,
-		pgx.Identifier{stagingTableName}, // Use the passed-in table name.
-		[]string{"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id"},
-		pgx.CopyFromSlice(len(trades), func(i int) ([]any, error) {
-			trade := trades[i]
-			return []any{trade.Hash, trade.ReferenceDate, trade.TransactionDate, trade.Ticker, trade.Identifier, trade.Price, trade.Quantity, trade.ClosingTime, trade.FileID}, nil
-		}),
+		pgx.Identifier{stagingTableName},
+		columnNames,
+		copySource,
 	)
 
-	if err != nil {
-		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
-	}
-
-	return nil
-}
-
-// InsertMultipleTrades inserts multiple trade records using the bulk load, filter, and insert pattern.
-func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error {
-	// Step 1: Bulk load into the worker's assigned staging table.
-	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
-	err := m.CopyTradesIntoStagingTable(trades, stagingTableName)
-	if err != nil {
-		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
-	}
-
-	// Step 2: Insert by exclusion, reading from the worker's assigned staging table.
-	insertQuery := fmt.Sprintf(`
-	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
-	SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
-	FROM %s s
-	WHERE NOT EXISTS (
-		SELECT 1
-		FROM trade_records t
-		WHERE t.reference_date = s.reference_date AND t.hash = s.hash
-	);
-	`, pgx.Identifier{stagingTableName}.Sanitize())
-
-	log.Printf("Inserting from staging table %s to main table.", stagingTableName)
-	_, err = m.dbpool.Exec(m.ctx, insertQuery)
-	if err != nil {
-		return fmt.Errorf("error inserting from staging table %s: %v", stagingTableName, err)
-	}
-
-	// Step 3: Truncate the worker's staging table to prepare for its *next* batch.
-	truncateQuery := fmt.Sprintf(`TRUNCATE %s;`, pgx.Identifier{stagingTableName}.Sanitize())
-	log.Printf("Truncating staging table %s.", stagingTableName)
-	_, err = m.dbpool.Exec(m.ctx, truncateQuery)
-	if err != nil {
-		// This is not a fatal error for the data itself, but should be logged as a warning.
-		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
-	}
-
-	return nil
+	return err
 }
 
 // InsertAllStagingTableData inserts all data from a staging table into trade_records without checking for duplicates.
 func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error {
+	tx, err := m.dbpool.Begin(m.ctx)
+	if err != nil {
+		return fmt.Errorf("error beginning transaction: %v", err)
+	}
+	defer tx.Rollback(m.ctx) // Rollback is a no-op if the transaction is already committed.
+
 	// Step 1: Bulk load into the worker's assigned staging table.
 	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
-	err := m.CopyTradesIntoStagingTable(trades, stagingTableName)
+	err = m.CopyTradesIntoStagingTable(tx, trades, stagingTableName)
 	if err != nil {
 		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
 	}
@@ -573,19 +528,34 @@ func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, st
 	`, pgx.Identifier{stagingTableName}.Sanitize())
 
 	log.Printf("Inserting all data from staging table %s to main table.", stagingTableName)
-	_, err = m.dbpool.Exec(m.ctx, insertQuery)
+	_, err = tx.Exec(m.ctx, insertQuery)
 	if err != nil {
 		return fmt.Errorf("error inserting all data from staging table %s: %v", stagingTableName, err)
 	}
 
-	return nil
+	// Step 3: Truncate the worker's staging table to prepare for its *next* batch.
+	truncateQuery := fmt.Sprintf(`TRUNCATE %s;`, pgx.Identifier{stagingTableName}.Sanitize())
+	log.Printf("Truncating staging table %s.", stagingTableName)
+	_, err = tx.Exec(m.ctx, truncateQuery)
+	if err != nil {
+		// This is not a fatal error for the data itself, but should be logged as a warning.
+		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
+	}
+
+	return tx.Commit(m.ctx)
 }
 
 // InsertDiffFromStagingTable inserts the difference between staging table data and trade_records
 // using a CTE to identify records in the staging table that are not in trade_records by hash value.
 func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error {
+	tx, err := m.dbpool.Begin(m.ctx)
+	if err != nil {
+		return fmt.Errorf("error beginning transaction: %v", err)
+	}
+	defer tx.Rollback(m.ctx)
+
 	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
-	err := m.CopyTradesIntoStagingTable(trades, stagingTableName)
+	err = m.CopyTradesIntoStagingTable(tx, trades, stagingTableName)
 	if err != nil {
 		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
 	}
@@ -593,8 +563,11 @@ func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, s
 	WITH staging_diff AS (
 		SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
 		FROM %s s
-		LEFT JOIN trade_records t ON t.hash = s.hash AND t.reference_date = s.reference_date
-		WHERE t.hash IS NULL
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM trade_records t
+			WHERE t.hash = s.hash AND t.reference_date = s.reference_date
+		)
 	)
 	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
 	SELECT hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
@@ -602,10 +575,19 @@ func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, s
 	`, pgx.Identifier{stagingTableName}.Sanitize())
 
 	log.Printf("Inserting differences from staging table %s to main table using CTE.", stagingTableName)
-	_, err = m.dbpool.Exec(m.ctx, insertDiffQuery)
+	_, err = tx.Exec(m.ctx, insertDiffQuery)
 	if err != nil {
 		return fmt.Errorf("error inserting differences from staging table %s: %v", stagingTableName, err)
 	}
 
-	return nil
+	// Step 3: Truncate the worker's staging table to prepare for its *next* batch.
+	truncateQuery := fmt.Sprintf(`TRUNCATE %s;`, pgx.Identifier{stagingTableName}.Sanitize())
+	log.Printf("Truncating staging table %s.", stagingTableName)
+	_, err = tx.Exec(m.ctx, truncateQuery)
+	if err != nil {
+		// This is not a fatal error for the data itself, but should be logged as a warning.
+		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
+	}
+
+	return tx.Commit(m.ctx)
 }

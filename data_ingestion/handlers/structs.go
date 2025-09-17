@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/db"
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/models"
 )
 
@@ -32,3 +33,17 @@ type Config struct {
 }
 
 type FileMap = map[int]string
+
+type SetupReturn struct {
+	fileInfo          []models.FileInfo
+	channels          *ExtractionChannels
+	waitGroups        *ExtractionWaitGroups
+	fileMap           *FileMap
+	fileErrorsMap     *FileErrorMap
+	createdPartitions *db.FirstWritePartition
+	cleanup           func()
+}
+
+func (s *SetupReturn) getValues() ([]models.FileInfo, *ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap, *db.FirstWritePartition, func()) {
+	return s.fileInfo, s.channels, s.waitGroups, s.fileMap, s.fileErrorsMap, s.createdPartitions, s.cleanup
+}

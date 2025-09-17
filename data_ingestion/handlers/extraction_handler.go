@@ -33,10 +33,13 @@ func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWor
 // Execute orchestrates the file processing workflow.
 func (h *ExtractionHandler) Execute(filesPath string) error {
 	// Step 0: Setup the extraction environment.
-	channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, err := h.setup(filesPath)
+	setupReturn, err := h.setup(filesPath)
 	if err != nil {
 		return err
 	}
+	fileInfo, channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, cleanup := setupReturn.getValues()
+
+	defer cleanup()
 
 	// Step 1: Start the error worker, this worker will handle async errors from the extraction process
 	waitGroups.errorWg.Add(1)
@@ -53,7 +56,7 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 
 	// Step 4: Start DB workers. And pass handler that will handle cases where the partition is empty or not.
 	err = dbWorkers(func(trades *[]*models.Trade, stagingTableName string) error {
-		if isPartitionEmpty((*trades)[0].ReferenceDate, createdPartitions) {
+		if isPartitionFirstWrite((*trades)[0].ReferenceDate, createdPartitions) {
 			//empty partition can benefit for insert without idempotency checks
 			return h.dbManager.InsertAllStagingTableData(*trades, stagingTableName)
 		} else {
@@ -64,17 +67,26 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 		return err
 	}
 
-	// Step 2: Wait for all processing to complete.
-	log.Println("Waiting for all workers to finish...")
+	// Step 5: Preprocess files and send jobs to the parser workers.
+	// This needs to be in a goroutine so that the main thread can close the jobs channel.
+	go func() {
+		h.preprocessFile(fileInfo, fileMap, channels)
+		close(channels.jobs) // Close the jobs channel after all jobs have been sent.
+	}()
+
+	// Step 6: Wait for all processing to complete.
+	log.Println("Waiting for parser workers to finish...")
 	waitGroups.parserWg.Wait()
 
-	// Close all date-specific result channels
+	// After parsers are done, close all date-specific results channels to signal DB workers to finish.
 	for _, resultsChan := range channels.results {
 		close(resultsChan)
 	}
 
-	close(channels.jobs)
+	log.Println("Waiting for DB workers to finish...")
 	waitGroups.dbWg.Wait()
+
+	// Close the errors channel after all workers that can produce errors are done.
 	close(channels.errors)
 
 	// TODO: This needs cleanup, it does not need to be a separate worker, can be sync, also
@@ -89,7 +101,7 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 	return nil
 }
 
-func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap, *db.FirstWritePartition, error) {
+func (h *ExtractionHandler) setup(filesPath string) (SetupReturn, error) {
 	// Step 0.1: Setup channels, waitgroups, file map, and error map.
 	jobs := make(chan models.FileProcessingJob, 100)
 	errors := make(chan models.AppError, 100)
@@ -106,28 +118,36 @@ func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *Extra
 	fileErrorsMap := FileErrorMap{errors: make(map[int][]models.AppError)}
 	// Step 0.2: Synchronously get all file paths and their reference dates.
 	log.Println("Scanning files to determine required partitions...")
-	fileInfo, err := h.buildDatesSetAndFiles(filesPath)
+	referenceDates, err := h.getReferenceDates(filesPath)
 	if err != nil {
 		log.Fatalf("Failed to scan files: %v", err)
-		return nil, nil, nil, nil, nil, err
+		return SetupReturn{}, err
 	}
 
 	// Step 0.3: Setup the database and get the cleanup function.
-	cleanup, createdPartitions, err := h.setupDatabase(fileInfo, &channels)
+	cleanup, createdPartitions, err := h.setupDatabase(referenceDates, &channels)
 	if err != nil {
 		log.Fatalf("Failed to setup database: %v", err)
-		return nil, nil, nil, nil, nil, err
+		return SetupReturn{}, err
 	}
-	defer cleanup()
+
 	log.Println("Database setup complete. All necessary tables and partitions are ready.")
 
 	// Step 0.4: Preprocess files.
 	log.Println("Preprocessing files...")
-	h.preprocessFile(fileInfo, &fileMap, &channels)
+	h.preprocessFile(referenceDates, &fileMap, &channels)
 
 	// Step 0.5: Start all worker pools.
 	log.Println("Starting worker pools...")
-	return &channels, &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg}, &fileMap, &fileErrorsMap, createdPartitions, nil
+	return SetupReturn{
+		fileInfo:          referenceDates,
+		channels:          &channels,
+		waitGroups:        &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg},
+		fileMap:           &fileMap,
+		fileErrorsMap:     &fileErrorsMap,
+		createdPartitions: createdPartitions,
+		cleanup:           cleanup,
+	}, nil
 }
 
 func (h *ExtractionHandler) configDbWorkers(channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) func(func(*[]*models.Trade, string) error) error {
@@ -156,6 +176,17 @@ func (h *ExtractionHandler) preprocessFile(fileInfo []models.FileInfo, fileMap *
 			continue // Skip file if checksum fails
 		}
 
+		// Check if file is already processed
+		isProcessed, err := h.dbManager.IsFileAlreadyProcessed(checksum)
+		if err != nil {
+			log.Printf("Error checking if file is already processed for %s: %v\n", fileInfo.Path, err)
+			continue // Skip file if checksum fails
+		}
+		if isProcessed {
+			log.Printf("File %s is already processed, skipping...\n", fileInfo.Path)
+			continue
+		}
+
 		// Synchronously create file record and get ID
 		fileID, err := h.dbManager.InsertFileRecord(fileInfo.Path, time.Now(), db.FILE_STATUS_PROCESSING, checksum, fileInfo.ReferenceDate)
 		if err != nil {
@@ -182,6 +213,7 @@ func (h *ExtractionHandler) parserWorker(channels *ExtractionChannels, waitGroup
 
 // dbWorker processes trades from a specific date channel and inserts them into the database in batches.
 func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, resultsChan <-chan *models.Trade, errorsChan chan<- models.AppError, waitGroups *ExtractionWaitGroups, dbHandler func(*[]*models.Trade, string) error) {
+	log.Printf("DB Worker %d: Starting to process trades from channel %s\n", workerId, stagingTableName)
 	defer waitGroups.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.config.dbBatchSize)
 
@@ -208,7 +240,7 @@ func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, resu
 	if len(trades) > 0 {
 		log.Printf("DB Worker %d: Inserting final batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
 		// Using the DB manager's stored context
-		err := h.dbManager.InsertMultipleTrades(trades, stagingTableName)
+		err := dbHandler(&trades, stagingTableName)
 		if err != nil {
 			// The batch failed, so report an error for each unique FileID in the batch.
 			fileIDs := make(map[int]bool)
@@ -246,6 +278,7 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channe
 	// Create database tables // TEMP move this into docker setup
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
+	h.dbManager.CreateTradeRecordIndexes()
 
 	// Build a set of unique dates from the file information.
 	uniqueDates := make(map[time.Time]struct{})
@@ -314,9 +347,9 @@ func (h *ExtractionHandler) fileStatusWorker(fileErrorsMap *FileErrorMap, waitGr
 	}
 }
 
-// buildDatesSetAndFiles walks the directory, gets all file paths, and extracts the unique reference dates from them.
+// getReferenceDates walks the directory, gets all file paths, and extracts the unique reference dates from them.
 // This will allow us to know what dates we will be handling and will serve as a map for idempotency checks.
-func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.FileInfo, error) {
+func (h *ExtractionHandler) getReferenceDates(rootPath string) ([]models.FileInfo, error) {
 	var fileInfos []models.FileInfo
 
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
@@ -343,7 +376,7 @@ func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.Fil
 	return fileInfos, nil
 }
 
-func isPartitionEmpty(partitionName time.Time, partitionMap *db.FirstWritePartition) bool {
-	_, exists := (*partitionMap)[partitionName]
-	return !exists
+func isPartitionFirstWrite(partitionName time.Time, partitionMap *db.FirstWritePartition) bool {
+	wasCreatedThisRun := (*partitionMap)[partitionName]
+	return wasCreatedThisRun
 }
