@@ -28,6 +28,8 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 		file_name VARCHAR(255) NOT NULL,
 		processed_at TIMESTAMP NOT NULL,
 		status VARCHAR(50) NOT NULL CHECK (status IN ('DONE', 'DONE_WITH_ERRORS', 'PROCESSING', 'FATAL')),
+		checksum VARCHAR(64),
+		reference_date TIMESTAMP,
 		errors jsonb
 	);`
 
@@ -198,19 +200,34 @@ func (m *PostgresDBManager) isPartitionAlreadyExistsError(err error) bool {
 }
 
 // InsertFileRecord inserts a new file record into the file_records table.
-func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, status string) (int, error) {
+func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, status string, checksum string, referenceDate time.Time) (int, error) {
 	query := `
-	INSERT INTO file_records (file_name, processed_at, status)
-	VALUES ($1, $2, $3)
+	INSERT INTO file_records (file_name, processed_at, status, checksum, reference_date)
+	VALUES ($1, $2, $3, $4, $5)
 	RETURNING id;`
 
 	var fileID int
-	err := m.dbpool.QueryRow(context.Background(), query, fileName, date, status).Scan(&fileID)
+	err := m.dbpool.QueryRow(context.Background(), query, fileName, date, status, checksum, referenceDate).Scan(&fileID)
 	if err != nil {
 		return 0, fmt.Errorf("error inserting file record: %v", err)
 	}
 
 	return fileID, nil
+}
+
+// UpdateFileChecksum updates the checksum of a file record in the database.
+func (m *PostgresDBManager) UpdateFileChecksum(fileID int, checksum string) error {
+	query := `
+	UPDATE file_records
+	SET checksum = $1
+	WHERE id = $2;`
+
+	_, err := m.dbpool.Exec(context.Background(), query, checksum, fileID)
+	if err != nil {
+		return fmt.Errorf("error updating file checksum: %v", err)
+	}
+
+	return nil
 }
 
 // UpdateFileStatus updates the status of a file record in the database.

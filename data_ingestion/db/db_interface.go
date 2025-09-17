@@ -12,7 +12,8 @@ type DBManager interface {
 	CreateFileRecordsTable() error
 	CreateTradeRecordsTable() error
 	DropTradeRecordIndexes() error
-	InsertFileRecord(fileName string, date time.Time, status string) (int, error)
+	InsertFileRecord(fileName string, date time.Time, status string, checksum string, referenceDate time.Time) (int, error)
+	UpdateFileChecksum(fileID int, checksum string) error
 	UpdateFileStatus(fileID int, status string, errors any) error
 	CreateWorkerStagingTable(tableName string) error
 	DropWorkerStagingTable(tableName string) error
