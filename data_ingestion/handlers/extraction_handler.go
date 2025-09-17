@@ -223,7 +223,7 @@ func (h *ExtractionHandler) ErrorWorker(channels *ExtractionChannels, fileErrors
 
 // FileStatusWorker updates the final status of each processed file based on whether errors occurred.
 func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func() {
-	// Create database tables
+	// Create database tables // TEMP move this into docker setup
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
 
@@ -235,33 +235,23 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func()
 	}
 	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
 
+	// Convert the unique dates map to a slice for the batch operation
+	dates := make([]time.Time, 0, len(uniqueDates))
 	for date := range uniqueDates {
-		exists, err := h.dbManager.CheckIfPartitionExists(date)
-		if err != nil {
-			log.Fatalf("Failed to check for partition for date %s: %v", date.Format("2006-01-02"), err)
-			panic(err) // Fatal cannot continue
-		}
-
-		if !exists {
-			if err := h.dbManager.CreatePartitionForDate(date); err != nil {
-				// If partition creation fails, it's a fatal error as ingestion will fail.
-				log.Fatalf("Failed to create partition for date %s: %v", date.Format("2006-01-02"), err)
-				panic(err) // Fatal cannot continue
-			}
-		} else {
-			log.Printf("Partition for date %s already exists. Skipping creation.", date.Format("2006-01-02"))
-		}
+		dates = append(dates, date)
 	}
 
-	// Create staging tables for each DB worker and collect their names for cleanup.
-	var stagingTableNames []string
-	for w := 1; w <= h.config.numDBWorkers; w++ {
-		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
-		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
-			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
-			panic(err) // Fatal cannot continue
-		}
-		stagingTableNames = append(stagingTableNames, stagingTableName)
+	// Create all needed partitions in a single transaction
+	if err := h.dbManager.CreatePartitionsForDates(dates); err != nil {
+		log.Fatalf("Failed to create partitions: %v", err)
+		panic(err) // Fatal cannot continue
+	}
+
+	// Create staging tables for each DB worker in a single transaction
+	stagingTableNames, err := h.dbManager.CreateWorkerStagingTables(h.config.numDBWorkers)
+	if err != nil {
+		log.Fatalf("Failed to create staging tables: %v", err)
+		panic(err) // Fatal cannot continue
 	}
 
 	// Return a cleanup function to be deferred by the caller.
@@ -294,6 +284,7 @@ func (h *ExtractionHandler) FileStatusWorker(channels *ExtractionChannels, fileE
 }
 
 // buildDatesSetAndFiles walks the directory, gets all file paths, and extracts the unique reference dates from them.
+// This will allow us to know what dates we will be handling and will serve as a map for idempotency checks.
 func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.FileInfo, error) {
 	var fileInfos []models.FileInfo
 

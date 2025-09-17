@@ -15,10 +15,12 @@ type DBManager interface {
 	UpdateFileChecksum(fileID int, checksum string) error
 	UpdateFileStatus(fileID int, status string, errors any) error
 	CreateWorkerStagingTable(tableName string) error
+	CreateWorkerStagingTables(numTables int) ([]string, error)
 	DropWorkerStagingTable(tableName string) error
 	InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error
 	CheckIfPartitionExists(date time.Time) (bool, error)
 	CreatePartitionForDate(date time.Time) error
+	CreatePartitionsForDates(dates []time.Time) error
 	InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error
 	InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error
 	CopyTradesIntoStagingTable(trades []*models.Trade, stagingTableName string) error
