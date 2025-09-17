@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"sync"
@@ -43,7 +44,8 @@ func main() {
 	errors := make(chan models.AppError, 100)
 	var parserWg, dbWg, errorWg sync.WaitGroup
 
-	dbManager := db.NewPostgresDBManager(dbpool)
+	ctx := context.Background()
+	dbManager := db.NewPostgresDBManager(ctx, dbpool)
 
 	handler := handlers.NewExtractionHandler(dbManager, jobs, results, errors, &parserWg, &dbWg, &errorWg, numParserWorkers, numDBWorkers, dbBatchSize)
 

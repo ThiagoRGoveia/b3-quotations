@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
@@ -123,14 +122,13 @@ func (h *ExtractionHandler) ParserWorker() {
 func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
 	defer h.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.dbBatchSize)
-	ctx := context.Background()
 
 	for result := range h.results {
 		trades = append(trades, result)
 		if len(trades) >= h.dbBatchSize {
 			log.Printf("DB Worker %d: Inserting batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
-			// CHANGE: Pass the context and the worker's unique staging table name.
-			err := h.dbManager.InsertMultipleTrades(ctx, trades, stagingTableName)
+			// Using the DB manager's stored context
+			err := h.dbManager.InsertMultipleTrades(trades, stagingTableName)
 			if err != nil {
 				// The batch failed, so report an error for each unique FileID in the batch.
 				// Maybe log the trades that failed? A next step here is retry logic but since
@@ -151,8 +149,8 @@ func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
 	// Insert any remaining trades
 	if len(trades) > 0 {
 		log.Printf("DB Worker %d: Inserting final batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
-		// CHANGE: Pass the context and the worker's unique staging table name.
-		err := h.dbManager.InsertMultipleTrades(ctx, trades, stagingTableName)
+		// Using the DB manager's stored context
+		err := h.dbManager.InsertMultipleTrades(trades, stagingTableName)
 		if err != nil {
 			// The batch failed, so report an error for each unique FileID in the batch.
 			fileIDs := make(map[int]bool)
@@ -200,15 +198,14 @@ func (h *ExtractionHandler) setupDatabase(fileInfos []models.FileInfo) func() {
 	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
 
 	// Synchronously create all required partitions before processing starts.
-	ctx := context.Background()
 	for date := range uniqueDates {
-		exists, err := h.dbManager.CheckIfPartitionExists(ctx, date)
+		exists, err := h.dbManager.CheckIfPartitionExists(date)
 		if err != nil {
 			log.Fatalf("Failed to check for partition for date %s: %v", date.Format("2006-01-02"), err)
 		}
 
 		if !exists {
-			if err := h.dbManager.CreatePartitionForDate(ctx, date); err != nil {
+			if err := h.dbManager.CreatePartitionForDate(date); err != nil {
 				// If partition creation fails, it's a fatal error as ingestion will fail.
 				log.Fatalf("Failed to create partition for date %s: %v", date.Format("2006-01-02"), err)
 			}
