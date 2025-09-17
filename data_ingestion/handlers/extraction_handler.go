@@ -52,56 +52,39 @@ func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, resu
 func (h *ExtractionHandler) Extract(filesPath string) error {
 	processedFiles := make(map[int]string)
 
-	// Setup database tables
-	h.dbManager.CreateFileRecordsTable()
-	h.dbManager.CreateTradeRecordsTable()
-
-	// Step 1: Synchronously build a set of all reference dates needed and get file paths.
+	// Step 1: Synchronously get all file paths and their reference dates.
 	log.Println("Scanning files to determine required partitions...")
-	uniqueDates, filePaths, err := h.buildDatesSetAndFiles(filesPath)
+	fileInfo, err := h.buildDatesSetAndFiles(filesPath)
 	if err != nil {
-		log.Fatalf("Failed to scan files and build date set: %v", err)
-	}
-	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
-
-	// Step 2: Synchronously create all required partitions before processing starts.
-	ctx := context.Background()
-	for date := range uniqueDates {
-		if err := h.dbManager.CreatePartitionForDate(ctx, date); err != nil {
-			// If partition creation fails, it's a fatal error as ingestion will fail.
-			log.Fatalf("Failed to create partition for date %s: %v", date.Format("2006-01-02"), err)
-		}
-	}
-	log.Println("All necessary partitions are ready.")
-
-	// Step 3: Create staging tables for each DB worker.
-	// The deferred drop must be in this scope to prevent premature cleanup.
-	for w := 1; w <= h.numDBWorkers; w++ {
-		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
-		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
-			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
-		}
-		// Defer the drop until the entire Extract function completes.
-		defer func(tableName string) {
-			log.Printf("Cleaning up staging table %s", tableName)
-			h.dbManager.DropWorkerStagingTable(tableName)
-		}(stagingTableName)
+		log.Fatalf("Failed to scan files: %v", err)
 	}
 
-	// Step 4: Start all worker pools.
+	// Step 2: Setup the database and get the cleanup function.
+	cleanup := h.setupDatabase(fileInfo)
+	defer cleanup()
+	log.Println("Database setup complete. All necessary tables and partitions are ready.")
+
+	// Step 5: Start all worker pools.
 	h.startWorkers()
 
-	// Step 4: Dispatch jobs for each file.
+	// Step 6: Dispatch jobs for each file.
 	log.Println("Dispatching file processing jobs...")
-	for _, path := range filePaths {
-		// Synchronously create file record and get ID
-		fileID, err := h.dbManager.InsertFileRecord(path, time.Now(), db.FILE_STATUS_PROCESSING)
+	for _, fileInfo := range fileInfo {
+		// Calculate file checksum
+		checksum, err := parsers.GetFileChecksum(fileInfo.Path)
 		if err != nil {
-			log.Printf("Error inserting file record for %s: %v\n", path, err)
+			log.Printf("Error calculating checksum for file %s: %v\n", fileInfo.Path, err)
+			continue // Skip file if checksum fails
+		}
+
+		// Synchronously create file record and get ID
+		fileID, err := h.dbManager.InsertFileRecord(fileInfo.Path, time.Now(), db.FILE_STATUS_PROCESSING, checksum, fileInfo.ReferenceDate)
+		if err != nil {
+			log.Printf("Error inserting file record for %s: %v\n", fileInfo.Path, err)
 			continue // Continue to next file
 		}
-		processedFiles[fileID] = path
-		h.jobs <- models.FileJob{FilePath: path, FileID: fileID}
+		processedFiles[fileID] = fileInfo.Path
+		h.jobs <- models.FileJob{FilePath: fileInfo.Path, FileID: fileID}
 	}
 	close(h.jobs) // All jobs have been sent
 
@@ -203,6 +186,57 @@ func (h *ExtractionHandler) ErrorWorker() {
 }
 
 // FileStatusWorker updates the final status of each processed file based on whether errors occurred.
+func (h *ExtractionHandler) setupDatabase(fileInfos []models.FileInfo) func() {
+	// Create database tables
+	h.dbManager.CreateFileRecordsTable()
+	h.dbManager.CreateTradeRecordsTable()
+
+	// Build a set of unique dates from the file information.
+	uniqueDates := make(map[time.Time]struct{})
+	for _, fileInfo := range fileInfos {
+		normalizedDate := fileInfo.ReferenceDate.Truncate(24 * time.Hour)
+		uniqueDates[normalizedDate] = struct{}{}
+	}
+	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
+
+	// Synchronously create all required partitions before processing starts.
+	ctx := context.Background()
+	for date := range uniqueDates {
+		exists, err := h.dbManager.CheckIfPartitionExists(ctx, date)
+		if err != nil {
+			log.Fatalf("Failed to check for partition for date %s: %v", date.Format("2006-01-02"), err)
+		}
+
+		if !exists {
+			if err := h.dbManager.CreatePartitionForDate(ctx, date); err != nil {
+				// If partition creation fails, it's a fatal error as ingestion will fail.
+				log.Fatalf("Failed to create partition for date %s: %v", date.Format("2006-01-02"), err)
+			}
+		} else {
+			log.Printf("Partition for date %s already exists. Skipping creation.", date.Format("2006-01-02"))
+		}
+	}
+
+	// Create staging tables for each DB worker and collect their names for cleanup.
+	var stagingTableNames []string
+	for w := 1; w <= h.numDBWorkers; w++ {
+		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
+		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
+			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
+		}
+		stagingTableNames = append(stagingTableNames, stagingTableName)
+	}
+
+	// Return a cleanup function to be deferred by the caller.
+	return func() {
+		for _, tableName := range stagingTableNames {
+			log.Printf("Cleaning up staging table %s", tableName)
+			h.dbManager.DropWorkerStagingTable(tableName)
+		}
+	}
+}
+
+// FileStatusWorker updates the final status of each processed file based on whether errors occurred.
 func (h *ExtractionHandler) FileStatusWorker(processedFiles map[int]string) {
 	defer h.errorWg.Done()
 
@@ -223,9 +257,8 @@ func (h *ExtractionHandler) FileStatusWorker(processedFiles map[int]string) {
 }
 
 // buildDatesSetAndFiles walks the directory, gets all file paths, and extracts the unique reference dates from them.
-func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) (map[time.Time]struct{}, []string, error) {
-	uniqueDates := make(map[time.Time]struct{})
-	var filePaths []string
+func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.FileInfo, error) {
+	var fileInfos []models.FileInfo
 
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -239,34 +272,16 @@ func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) (map[time.Tim
 				return nil // Skip this file, but continue walking
 			}
 
-			// Normalize the date to midnight for consistency
-			normalizedDate := refDate.Truncate(24 * time.Hour)
-			uniqueDates[normalizedDate] = struct{}{}
-			filePaths = append(filePaths, path)
+			fileInfos = append(fileInfos, models.FileInfo{Path: path, ReferenceDate: refDate})
 		}
 		return nil
 	})
 
 	if err != nil {
-		return nil, nil, fmt.Errorf("error walking directory %s: %w", rootPath, err)
+		return nil, fmt.Errorf("error walking directory %s: %w", rootPath, err)
 	}
 
-	return uniqueDates, filePaths, nil
-}
-
-// startWorkers initializes and starts all the worker pools (parser, DB, error).
-func (h *ExtractionHandler) setupAndDeferStagingTableCleanup() {
-	for w := 1; w <= h.numDBWorkers; w++ {
-		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
-		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
-			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
-		}
-		// Defer the drop until the entire Extract function completes.
-		defer func(tableName string) {
-			log.Printf("Cleaning up staging table %s", tableName)
-			h.dbManager.DropWorkerStagingTable(tableName)
-		}(stagingTableName)
-	}
+	return fileInfos, nil
 }
 
 // startWorkers initializes and starts all the worker pools (parser, DB, error).
@@ -289,27 +304,4 @@ func (h *ExtractionHandler) startWorkers() {
 		h.dbWg.Add(1)
 		go h.DBWorker(w, stagingTableName)
 	}
-}
-
-func (h *ExtractionHandler) WalkDirectory(filesPath string, processedFiles map[int]string) {
-
-	defer close(h.jobs)
-
-	filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			h.errors <- models.AppError{FileID: -1, Message: "Failed to walk directory", Err: err}
-			return err
-		}
-		if !info.IsDir() {
-			// Synchronously create file record and get ID
-			fileID, err := h.dbManager.InsertFileRecord(path, time.Now(), db.FILE_STATUS_PROCESSING)
-			if err != nil {
-				log.Printf("Error inserting file record for %s: %v\n", path, err)
-				return nil // Continue to next file
-			}
-			processedFiles[fileID] = path
-			h.jobs <- models.FileJob{FilePath: path, FileID: fileID}
-		}
-		return nil
-	})
 }
