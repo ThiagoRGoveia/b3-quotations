@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -94,8 +95,8 @@ func parseRecord(record []string, fileID int) (*models.Trade, error) {
 	}, nil
 }
 
-// ParseCSV reads a CSV file from the given path and streams parsed records into a channel.
-func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors chan<- models.AppError) error {
+// ParseCSV reads a CSV file from the given path and streams parsed records into the appropriate channel based on reference date.
+func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *models.Trade, errors chan<- models.AppError) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		errors <- models.AppError{FileID: fileID, Message: "Failed to open file", Err: err}
@@ -122,7 +123,7 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors 
 			continue // Skip corrupted records
 		}
 
-		// Calculate MD5 hash of the raw CSV line
+		// Calculate hash of the raw CSV line
 		lineHash := calculateHash(record)
 
 		trade, err := parseRecord(record, fileID)
@@ -134,9 +135,17 @@ func ParseCSV(filePath string, fileID int, results chan<- *models.Trade, errors 
 		// Set the hash in the trade record
 		trade.Hash = lineHash
 
-		// Validate trade record
+		// Find the correct channel for this trade's reference date
+		resultsChan, exists := dateChannels[trade.ReferenceDate.Truncate(24*time.Hour)]
+		if !exists {
+			errors <- models.AppError{FileID: fileID, Message: "No channel found for reference date", Err: fmt.Errorf("missing channel for date: %v", trade.ReferenceDate), Trade: trade}
+			log.Fatalf("No channel found for reference date: %v, File ID: %d may be malformed", trade.ReferenceDate, fileID)
+			continue
+		}
+
+		// Validate trade record and send it to the proper channel
 		if trade.IsValid() {
-			results <- trade
+			resultsChan <- trade
 		} else {
 			errors <- models.AppError{FileID: fileID, Message: "Invalid trade record", Err: err, Trade: trade}
 		}

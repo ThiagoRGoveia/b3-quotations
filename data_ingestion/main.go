@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	numParserWorkers   = 7
-	numDBWorkers       = 14
-	resultsChannelSize = 500000
-	dbBatchSize        = 80000
+	numParserWorkers             = 7
+	numDBWorkersPerReferenceDate = 2
+	resultsChannelSize           = 500000
+	dbBatchSize                  = 80000
 )
 
 // setup initializes resources and returns handler and cleanup function
@@ -46,7 +46,7 @@ func setup() (string, *handlers.ExtractionHandler, func(), error) {
 	handler := handlers.NewExtractionHandler(
 		dbManager,
 		numParserWorkers,
-		numDBWorkers,
+		numDBWorkersPerReferenceDate,
 		dbBatchSize,
 		resultsChannelSize,
 	)

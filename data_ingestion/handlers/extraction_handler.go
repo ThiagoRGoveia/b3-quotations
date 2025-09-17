@@ -19,7 +19,7 @@ type FileErrorMap struct {
 }
 
 type ExtractionChannels struct {
-	results chan *models.Trade
+	results map[time.Time]chan *models.Trade
 	errors  chan models.AppError
 	jobs    chan models.FileProcessingJob
 }
@@ -31,10 +31,10 @@ type ExtractionWaitGroups struct {
 }
 
 type Config struct {
-	numParserWorkers   int
-	dbBatchSize        int
-	numDBWorkers       int
-	resultsChannelSize int
+	numParserWorkers             int
+	dbBatchSize                  int
+	numDBWorkersPerReferenceDate int
+	resultsChannelSize           int
 }
 
 type ExtractionHandler struct {
@@ -57,24 +57,30 @@ func SetupExtractionHandler(dbManager db.DBManager, config Config) *ExtractionHa
 
 // NewExtractionHandler creates a new ExtractionHandler with externally managed channels and waitgroups.
 // This function is kept for backward compatibility.
-func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWorkers int, dbBatchSize int, resultsChannelSize int) *ExtractionHandler {
+func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWorkersPerDate int, dbBatchSize int, resultsChannelSize int) *ExtractionHandler {
 	return &ExtractionHandler{
 		dbManager: dbManager,
 		config: Config{
-			numParserWorkers:   numParserWorkers,
-			numDBWorkers:       numDBWorkers,
-			dbBatchSize:        dbBatchSize,
-			resultsChannelSize: resultsChannelSize,
+			numParserWorkers:             numParserWorkers,
+			numDBWorkersPerReferenceDate: numDBWorkersPerDate,
+			dbBatchSize:                  dbBatchSize,
+			resultsChannelSize:           resultsChannelSize,
 		},
 	}
 }
 
 func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap) {
 	// Step 0.1: Setup channels, waitgroups, file map, and error map.
-	results := make(chan *models.Trade, h.config.resultsChannelSize)
 	jobs := make(chan models.FileProcessingJob, 100)
 	errors := make(chan models.AppError, 100)
-	channels := ExtractionChannels{results: results, errors: errors, jobs: jobs}
+
+	// Initialize the channels struct with empty map
+	channels := ExtractionChannels{
+		results: make(map[time.Time]chan *models.Trade),
+		errors:  errors,
+		jobs:    jobs,
+	}
+
 	var parserWg, dbWg, errorWg sync.WaitGroup
 	fileMap := make(map[int]string)
 	fileErrorsMap := FileErrorMap{errors: make(map[int][]models.AppError)}
@@ -87,7 +93,7 @@ func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *Extra
 	}
 
 	// Step 0.3: Setup the database and get the cleanup function.
-	cleanup := h.setupDatabase(fileInfo)
+	cleanup := h.setupDatabase(fileInfo, &channels)
 	defer cleanup()
 	log.Println("Database setup complete. All necessary tables and partitions are ready.")
 
@@ -111,7 +117,12 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 	// Step 2: Wait for all processing to complete.
 	log.Println("Waiting for all workers to finish...")
 	waitGroups.parserWg.Wait()
-	close(channels.results)
+
+	// Close all date-specific result channels
+	for _, resultsChan := range channels.results {
+		close(resultsChan)
+	}
+
 	close(channels.jobs)
 	waitGroups.dbWg.Wait()
 	close(channels.errors)
@@ -127,6 +138,10 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 	log.Println("Extraction process finished.")
 	return nil
 }
+
+// wip dont remove
+func (h *ExtractionHandler) handleNewReferenceDate()      {}
+func (h *ExtractionHandler) handleExistingReferenceDate() {}
 
 func (h *ExtractionHandler) preprocessFile(fileInfo []models.FileInfo, fileMap *FileMap, channels *ExtractionChannels) {
 	for _, fileInfo := range fileInfo {
@@ -148,7 +163,7 @@ func (h *ExtractionHandler) preprocessFile(fileInfo []models.FileInfo, fileMap *
 	}
 }
 
-// parserWorker reads file jobs from a channel, parses the files, and sends the results to another channel.
+// parserWorker reads file jobs from a channel, parses the files, and sends the results to appropriate date-specific channels.
 func (h *ExtractionHandler) parserWorker(channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) {
 	defer waitGroups.parserWg.Done()
 	for job := range channels.jobs {
@@ -161,12 +176,12 @@ func (h *ExtractionHandler) parserWorker(channels *ExtractionChannels, waitGroup
 	}
 }
 
-// dbWorker processes trades from a channel and inserts them into the database in batches.
-func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) {
+// dbWorker processes trades from a specific date channel and inserts them into the database in batches.
+func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, resultsChan <-chan *models.Trade, errorsChan chan<- models.AppError, waitGroups *ExtractionWaitGroups) {
 	defer waitGroups.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.config.dbBatchSize)
 
-	for result := range channels.results {
+	for result := range resultsChan {
 		trades = append(trades, result)
 		if len(trades) >= h.config.dbBatchSize {
 			log.Printf("DB Worker %d: Inserting batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
@@ -174,15 +189,12 @@ func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, chan
 			err := h.dbManager.InsertMultipleTrades(trades, stagingTableName)
 			if err != nil {
 				// The batch failed, so report an error for each unique FileID in the batch.
-				// Maybe log the trades that failed? A next step here is retry logic but since
-				// the error here suggests network or database connection issues, it's better
-				// to report the error and let the user handle it.
 				fileIDs := make(map[int]bool)
 				for _, trade := range trades {
 					fileIDs[trade.FileID] = true
 				}
 				for fileID := range fileIDs {
-					channels.errors <- models.AppError{FileID: fileID, Message: "Failed to insert batch of trades", Err: err}
+					errorsChan <- models.AppError{FileID: fileID, Message: "Failed to insert batch of trades", Err: err}
 				}
 			}
 			trades = trades[:0] // Clear the slice
@@ -201,7 +213,7 @@ func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, chan
 				fileIDs[trade.FileID] = true
 			}
 			for fileID := range fileIDs {
-				channels.errors <- models.AppError{FileID: fileID, Message: "Failed to insert remaining batch of trades", Err: err}
+				errorsChan <- models.AppError{FileID: fileID, Message: "Failed to insert remaining batch of trades", Err: err}
 			}
 		}
 	}
@@ -227,7 +239,7 @@ func (h *ExtractionHandler) errorWorker(channels *ExtractionChannels, fileErrors
 }
 
 // FileStatusWorker updates the final status of each processed file based on whether errors occurred.
-func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func() {
+func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channels *ExtractionChannels) func() {
 	// Create database tables // TEMP move this into docker setup
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
@@ -237,6 +249,12 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func()
 	for _, fileInfo := range fileInfoList {
 		normalizedDate := fileInfo.ReferenceDate.Truncate(24 * time.Hour)
 		uniqueDates[normalizedDate] = struct{}{}
+
+		// Create a results channel for this date if it doesn't exist yet
+		if _, exists := channels.results[normalizedDate]; !exists {
+			channels.results[normalizedDate] = make(chan *models.Trade, h.config.resultsChannelSize)
+			log.Printf("Created results channel for date: %s", normalizedDate.Format("2006-01-02"))
+		}
 	}
 	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
 
@@ -252,8 +270,12 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func()
 		panic(err) // Fatal cannot continue
 	}
 
+	// Calculate the total number of DB workers (numDates * numDBWorkersPerDate)
+	totalDBWorkers := len(uniqueDates) * h.config.numDBWorkersPerReferenceDate
+	log.Printf("Creating %d staging tables for %d dates with %d workers per date", totalDBWorkers, len(uniqueDates), h.config.numDBWorkersPerReferenceDate)
+
 	// Create staging tables for each DB worker in a single transaction
-	stagingTableNames, err := h.dbManager.CreateWorkerStagingTables(h.config.numDBWorkers)
+	stagingTableNames, err := h.dbManager.CreateWorkerStagingTables(totalDBWorkers)
 	if err != nil {
 		log.Fatalf("Failed to create staging tables: %v", err)
 		panic(err) // Fatal cannot continue
@@ -329,12 +351,21 @@ func (h *ExtractionHandler) startWorkers(channels *ExtractionChannels, fileError
 		go h.parserWorker(channels, waitGroups)
 	}
 
-	// Step 1.2: Start DB workers
-	for w := 1; w <= h.config.numDBWorkers; w++ {
-		workerId := w
-		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
-		// The staging table is already created in the Extract method.
-		waitGroups.dbWg.Add(1)
-		go h.dbWorker(w, stagingTableName, channels, waitGroups)
+	// Step 1.2: Start DB workers for each date channel
+	workerCounter := 1
+	for date, resultsChan := range channels.results {
+		formattedDate := date.Format("2006-01-02")
+		log.Printf("Starting %d DB workers for date %s", h.config.numDBWorkersPerReferenceDate, formattedDate)
+
+		// Start configured number of workers for this date
+		for w := 1; w <= h.config.numDBWorkersPerReferenceDate; w++ {
+			workerId := workerCounter
+			stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
+			// The staging table is already created in the setupDatabase method
+			waitGroups.dbWg.Add(1)
+			log.Printf("Starting DB worker %d for date %s using table %s", workerId, formattedDate, stagingTableName)
+			go h.dbWorker(workerId, stagingTableName, resultsChan, channels.errors, waitGroups)
+			workerCounter++
+		}
 	}
 }
