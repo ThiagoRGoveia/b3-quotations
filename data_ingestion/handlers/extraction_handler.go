@@ -69,21 +69,16 @@ func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWor
 	}
 }
 
-func (h *ExtractionHandler) Setup() (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap) {
+func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap) {
+	// Step 0.1: Setup channels, waitgroups, file map, and error map.
 	results := make(chan *models.Trade, h.config.resultsChannelSize)
 	jobs := make(chan models.FileProcessingJob, 100)
 	errors := make(chan models.AppError, 100)
+	channels := ExtractionChannels{results: results, errors: errors, jobs: jobs}
 	var parserWg, dbWg, errorWg sync.WaitGroup
 	fileMap := make(map[int]string)
 	fileErrorsMap := FileErrorMap{errors: make(map[int][]models.AppError)}
-	return &ExtractionChannels{results: results, errors: errors, jobs: jobs}, &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg}, &fileMap, &fileErrorsMap
-}
-
-// Execute orchestrates the file processing workflow.
-func (h *ExtractionHandler) Execute(filesPath string) error {
-	// Step 0: Setup channels, waitgroups, file map, and error map.
-	channels, waitGroups, fileMap, fileErrorsMap := h.Setup()
-	// Step 1: Synchronously get all file paths and their reference dates.
+	// Step 0.2: Synchronously get all file paths and their reference dates.
 	log.Println("Scanning files to determine required partitions...")
 	fileInfo, err := h.buildDatesSetAndFiles(filesPath)
 	if err != nil {
@@ -91,20 +86,29 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 		panic(err)
 	}
 
-	// Step 2: Setup the database and get the cleanup function.
+	// Step 0.3: Setup the database and get the cleanup function.
 	cleanup := h.setupDatabase(fileInfo)
 	defer cleanup()
 	log.Println("Database setup complete. All necessary tables and partitions are ready.")
 
-	// Step 3: Preprocess files.
+	// Step 0.4: Preprocess files.
 	log.Println("Preprocessing files...")
-	h.PreprocessFile(fileInfo, fileMap, channels)
+	h.preprocessFile(fileInfo, &fileMap, &channels)
 
-	// Step 4: Start all worker pools.
+	// Step 0.5: Start all worker pools.
 	log.Println("Starting worker pools...")
+	return &channels, &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg}, &fileMap, &fileErrorsMap
+}
+
+// Execute orchestrates the file processing workflow.
+func (h *ExtractionHandler) Execute(filesPath string) error {
+	// Step 0: Setup the extraction environment.
+	channels, waitGroups, fileMap, fileErrorsMap := h.setup(filesPath)
+
+	// Step 1: Start the concurrent workers.
 	h.startWorkers(channels, fileErrorsMap, waitGroups)
 
-	// Step 5: Wait for all processing to complete.
+	// Step 2: Wait for all processing to complete.
 	log.Println("Waiting for all workers to finish...")
 	waitGroups.parserWg.Wait()
 	close(channels.results)
@@ -112,9 +116,10 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 	waitGroups.dbWg.Wait()
 	close(channels.errors)
 
-	// Start the file status worker after all file-related processing is done
+	// TODO: This needs cleanup, it does not need to be a separate worker, can be sync, also
+	// needs error handling, and the updates can be batched.
 	waitGroups.errorWg.Add(1)
-	go h.FileStatusWorker(channels, fileErrorsMap, waitGroups, fileMap)
+	go h.fileStatusWorker(fileErrorsMap, waitGroups, fileMap)
 
 	// Wait for the error and status workers to finish
 	waitGroups.errorWg.Wait()
@@ -123,7 +128,7 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 	return nil
 }
 
-func (h *ExtractionHandler) PreprocessFile(fileInfo []models.FileInfo, fileMap *FileMap, channels *ExtractionChannels) {
+func (h *ExtractionHandler) preprocessFile(fileInfo []models.FileInfo, fileMap *FileMap, channels *ExtractionChannels) {
 	for _, fileInfo := range fileInfo {
 		// Calculate file checksum
 		checksum, err := parsers.GetFileChecksum(fileInfo.Path)
@@ -143,8 +148,8 @@ func (h *ExtractionHandler) PreprocessFile(fileInfo []models.FileInfo, fileMap *
 	}
 }
 
-// ParserWorker reads file jobs from a channel, parses the files, and sends the results to another channel.
-func (h *ExtractionHandler) ParserWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
+// parserWorker reads file jobs from a channel, parses the files, and sends the results to another channel.
+func (h *ExtractionHandler) parserWorker(channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) {
 	defer waitGroups.parserWg.Done()
 	for job := range channels.jobs {
 		log.Printf("Parser worker started job for file %s (ID: %d)\n", job.FilePath, job.FileID)
@@ -156,8 +161,8 @@ func (h *ExtractionHandler) ParserWorker(channels *ExtractionChannels, fileError
 	}
 }
 
-// DBWorker processes trades from a channel and inserts them into the database in batches.
-func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string, channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) {
+// dbWorker processes trades from a channel and inserts them into the database in batches.
+func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) {
 	defer waitGroups.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.config.dbBatchSize)
 
@@ -204,8 +209,8 @@ func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string, chan
 	log.Printf("DB worker %d finished.", workerId)
 }
 
-// ErrorWorker listens on the error channel, logs the errors, and tracks them by FileID.
-func (h *ExtractionHandler) ErrorWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
+// errorWorker listens on the error channel, logs the errors, and tracks them by FileID.
+func (h *ExtractionHandler) errorWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
 	defer waitGroups.errorWg.Done()
 	for appErr := range channels.errors {
 		log.Printf("Caught error: %s\n", appErr.Error())
@@ -263,8 +268,8 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func()
 	}
 }
 
-// FileStatusWorker updates the final status of each processed file based on whether errors occurred.
-func (h *ExtractionHandler) FileStatusWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups, fileMap *FileMap) {
+// fileStatusWorker updates the final status of each processed file based on whether errors occurred.
+func (h *ExtractionHandler) fileStatusWorker(fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups, fileMap *FileMap) {
 	defer waitGroups.errorWg.Done()
 
 	fileErrorsMap.mu.Lock()
@@ -314,22 +319,22 @@ func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.Fil
 
 // startWorkers initializes and starts all the worker pools (parser, DB, error).
 func (h *ExtractionHandler) startWorkers(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
-	// Start the error worker
+	// Step 1.0: Start the error worker
 	waitGroups.errorWg.Add(1)
-	go h.ErrorWorker(channels, fileErrorsMap, waitGroups)
+	go h.errorWorker(channels, fileErrorsMap, waitGroups)
 
-	// Start parser workers
+	// Step 1.1: Start parser workers
 	for w := 1; w <= h.config.numParserWorkers; w++ {
 		waitGroups.parserWg.Add(1)
-		go h.ParserWorker(channels, fileErrorsMap, waitGroups)
+		go h.parserWorker(channels, waitGroups)
 	}
 
-	// Start DB workers
+	// Step 1.2: Start DB workers
 	for w := 1; w <= h.config.numDBWorkers; w++ {
 		workerId := w
 		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
 		// The staging table is already created in the Extract method.
 		waitGroups.dbWg.Add(1)
-		go h.DBWorker(w, stagingTableName, channels, waitGroups)
+		go h.dbWorker(w, stagingTableName, channels, waitGroups)
 	}
 }
