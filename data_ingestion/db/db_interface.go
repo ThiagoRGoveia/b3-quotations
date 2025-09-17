@@ -19,4 +19,8 @@ type DBManager interface {
 	InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error
 	CheckIfPartitionExists(date time.Time) (bool, error)
 	CreatePartitionForDate(date time.Time) error
+	InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error
+	InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error
+	CopyTradesIntoStagingTable(trades []*models.Trade, stagingTableName string) error
+	FindFileRecordByChecksum(checksum string) (*models.FileRecord, error)
 }

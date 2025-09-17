@@ -13,49 +13,82 @@ import (
 	"github.com/ThiagoRGoveia/b3-quotations.git/data-ingestion/parsers"
 )
 
-// ExtractionHandler manages the data extraction and processing workflow.
-type ExtractionHandler struct {
-	dbManager        db.DBManager
-	jobs             chan models.FileJob
-	results          chan *models.Trade
-	errors           chan models.AppError
-	parserWg         *sync.WaitGroup
-	dbWg             *sync.WaitGroup
-	errorWg          *sync.WaitGroup
-	numParserWorkers int
-	dbBatchSize      int
-	numDBWorkers     int
-
-	fileErrors   map[int][]models.AppError
-	fileErrorsMu sync.Mutex
+type FileErrorMap struct {
+	errors map[int][]models.AppError
+	mu     sync.Mutex
 }
 
-// NewExtractionHandler creates a new ExtractionHandler.
-func NewExtractionHandler(dbManager db.DBManager, jobs chan models.FileJob, results chan *models.Trade, errors chan models.AppError, parserWg *sync.WaitGroup, dbWg *sync.WaitGroup, errorWg *sync.WaitGroup, numParserWorkers int, numDBWorkers int, dbBatchSize int) *ExtractionHandler {
+type ExtractionChannels struct {
+	results chan *models.Trade
+	errors  chan models.AppError
+	jobs    chan models.FileProcessingJob
+}
+
+type ExtractionWaitGroups struct {
+	parserWg *sync.WaitGroup
+	dbWg     *sync.WaitGroup
+	errorWg  *sync.WaitGroup
+}
+
+type Config struct {
+	numParserWorkers   int
+	dbBatchSize        int
+	numDBWorkers       int
+	resultsChannelSize int
+}
+
+type ExtractionHandler struct {
+	dbManager db.DBManager
+	config    Config
+}
+
+// FileMap is a map of file IDs to their paths.
+type FileMap = map[int]string
+
+// SetupExtractionHandler creates a new ExtractionHandler with all necessary channels and waitgroups.
+func SetupExtractionHandler(dbManager db.DBManager, config Config) *ExtractionHandler {
+	// Create channels
+
 	return &ExtractionHandler{
-		dbManager:        dbManager,
-		jobs:             jobs,
-		results:          results,
-		errors:           errors,
-		parserWg:         parserWg,
-		dbWg:             dbWg,
-		errorWg:          errorWg,
-		numParserWorkers: numParserWorkers,
-		dbBatchSize:      dbBatchSize,
-		numDBWorkers:     numDBWorkers,
-		fileErrors:       make(map[int][]models.AppError),
+		dbManager: dbManager,
+		config:    config,
 	}
 }
 
-// Extract orchestrates the file processing workflow.
-func (h *ExtractionHandler) Extract(filesPath string) error {
-	processedFiles := make(map[int]string)
+// NewExtractionHandler creates a new ExtractionHandler with externally managed channels and waitgroups.
+// This function is kept for backward compatibility.
+func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWorkers int, dbBatchSize int, resultsChannelSize int) *ExtractionHandler {
+	return &ExtractionHandler{
+		dbManager: dbManager,
+		config: Config{
+			numParserWorkers:   numParserWorkers,
+			numDBWorkers:       numDBWorkers,
+			dbBatchSize:        dbBatchSize,
+			resultsChannelSize: resultsChannelSize,
+		},
+	}
+}
 
+func (h *ExtractionHandler) Setup() (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap) {
+	results := make(chan *models.Trade, h.config.resultsChannelSize)
+	jobs := make(chan models.FileProcessingJob, 100)
+	errors := make(chan models.AppError, 100)
+	var parserWg, dbWg, errorWg sync.WaitGroup
+	fileMap := make(map[int]string)
+	fileErrorsMap := FileErrorMap{errors: make(map[int][]models.AppError)}
+	return &ExtractionChannels{results: results, errors: errors, jobs: jobs}, &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg}, &fileMap, &fileErrorsMap
+}
+
+// Execute orchestrates the file processing workflow.
+func (h *ExtractionHandler) Execute(filesPath string) error {
+	// Step 0: Setup channels, waitgroups, file map, and error map.
+	channels, waitGroups, fileMap, fileErrorsMap := h.Setup()
 	// Step 1: Synchronously get all file paths and their reference dates.
 	log.Println("Scanning files to determine required partitions...")
 	fileInfo, err := h.buildDatesSetAndFiles(filesPath)
 	if err != nil {
 		log.Fatalf("Failed to scan files: %v", err)
+		panic(err)
 	}
 
 	// Step 2: Setup the database and get the cleanup function.
@@ -63,11 +96,34 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 	defer cleanup()
 	log.Println("Database setup complete. All necessary tables and partitions are ready.")
 
-	// Step 5: Start all worker pools.
-	h.startWorkers()
+	// Step 3: Preprocess files.
+	log.Println("Preprocessing files...")
+	h.PreprocessFile(fileInfo, fileMap, channels)
 
-	// Step 6: Dispatch jobs for each file.
-	log.Println("Dispatching file processing jobs...")
+	// Step 4: Start all worker pools.
+	log.Println("Starting worker pools...")
+	h.startWorkers(channels, fileErrorsMap, waitGroups)
+
+	// Step 5: Wait for all processing to complete.
+	log.Println("Waiting for all workers to finish...")
+	waitGroups.parserWg.Wait()
+	close(channels.results)
+	close(channels.jobs)
+	waitGroups.dbWg.Wait()
+	close(channels.errors)
+
+	// Start the file status worker after all file-related processing is done
+	waitGroups.errorWg.Add(1)
+	go h.FileStatusWorker(channels, fileErrorsMap, waitGroups, fileMap)
+
+	// Wait for the error and status workers to finish
+	waitGroups.errorWg.Wait()
+
+	log.Println("Extraction process finished.")
+	return nil
+}
+
+func (h *ExtractionHandler) PreprocessFile(fileInfo []models.FileInfo, fileMap *FileMap, channels *ExtractionChannels) {
 	for _, fileInfo := range fileInfo {
 		// Calculate file checksum
 		checksum, err := parsers.GetFileChecksum(fileInfo.Path)
@@ -82,50 +138,32 @@ func (h *ExtractionHandler) Extract(filesPath string) error {
 			log.Printf("Error inserting file record for %s: %v\n", fileInfo.Path, err)
 			continue // Continue to next file
 		}
-		processedFiles[fileID] = fileInfo.Path
-		h.jobs <- models.FileJob{FilePath: fileInfo.Path, FileID: fileID}
+		(*fileMap)[fileID] = fileInfo.Path
+		channels.jobs <- models.FileProcessingJob{FilePath: fileInfo.Path, FileID: fileID}
 	}
-	close(h.jobs) // All jobs have been sent
-
-	// Step 5: Wait for all processing to complete.
-	log.Println("Waiting for all workers to finish...")
-	h.parserWg.Wait()
-	close(h.results)
-	h.dbWg.Wait()
-	close(h.errors)
-
-	// Start the file status worker after all file-related processing is done
-	h.errorWg.Add(1)
-	go h.FileStatusWorker(processedFiles)
-
-	// Wait for the error and status workers to finish
-	h.errorWg.Wait()
-
-	log.Println("Extraction process finished.")
-	return nil
 }
 
 // ParserWorker reads file jobs from a channel, parses the files, and sends the results to another channel.
-func (h *ExtractionHandler) ParserWorker() {
-	defer h.parserWg.Done()
-	for job := range h.jobs {
+func (h *ExtractionHandler) ParserWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
+	defer waitGroups.parserWg.Done()
+	for job := range channels.jobs {
 		log.Printf("Parser worker started job for file %s (ID: %d)\n", job.FilePath, job.FileID)
-		err := parsers.ParseCSV(job.FilePath, job.FileID, h.results, h.errors)
+		err := parsers.ParseCSV(job.FilePath, job.FileID, channels.results, channels.errors)
 		if err != nil {
-			h.errors <- models.AppError{FileID: job.FileID, Message: "Failed to open or read file", Err: err}
+			channels.errors <- models.AppError{FileID: job.FileID, Message: "Failed to open or read file", Err: err}
 		}
 		log.Printf("Parser worker finished job for file %s (ID: %d)\n", job.FilePath, job.FileID)
 	}
 }
 
 // DBWorker processes trades from a channel and inserts them into the database in batches.
-func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
-	defer h.dbWg.Done()
-	trades := make([]*models.Trade, 0, h.dbBatchSize)
+func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string, channels *ExtractionChannels, waitGroups *ExtractionWaitGroups) {
+	defer waitGroups.dbWg.Done()
+	trades := make([]*models.Trade, 0, h.config.dbBatchSize)
 
-	for result := range h.results {
+	for result := range channels.results {
 		trades = append(trades, result)
-		if len(trades) >= h.dbBatchSize {
+		if len(trades) >= h.config.dbBatchSize {
 			log.Printf("DB Worker %d: Inserting batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
 			// Using the DB manager's stored context
 			err := h.dbManager.InsertMultipleTrades(trades, stagingTableName)
@@ -139,7 +177,7 @@ func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
 					fileIDs[trade.FileID] = true
 				}
 				for fileID := range fileIDs {
-					h.errors <- models.AppError{FileID: fileID, Message: "Failed to insert batch of trades", Err: err}
+					channels.errors <- models.AppError{FileID: fileID, Message: "Failed to insert batch of trades", Err: err}
 				}
 			}
 			trades = trades[:0] // Clear the slice
@@ -158,7 +196,7 @@ func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
 				fileIDs[trade.FileID] = true
 			}
 			for fileID := range fileIDs {
-				h.errors <- models.AppError{FileID: fileID, Message: "Failed to insert remaining batch of trades", Err: err}
+				channels.errors <- models.AppError{FileID: fileID, Message: "Failed to insert remaining batch of trades", Err: err}
 			}
 		}
 	}
@@ -167,15 +205,15 @@ func (h *ExtractionHandler) DBWorker(workerId int, stagingTableName string) {
 }
 
 // ErrorWorker listens on the error channel, logs the errors, and tracks them by FileID.
-func (h *ExtractionHandler) ErrorWorker() {
-	defer h.errorWg.Done()
-	for appErr := range h.errors {
+func (h *ExtractionHandler) ErrorWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
+	defer waitGroups.errorWg.Done()
+	for appErr := range channels.errors {
 		log.Printf("Caught error: %s\n", appErr.Error())
 		// limit the number of errors per file to prevent memory overflow, if more than 100 errors are collected, then file is probably malformed
-		if appErr.FileID != -1 && len(h.fileErrors) < 100 {
-			h.fileErrorsMu.Lock()
-			h.fileErrors[appErr.FileID] = append(h.fileErrors[appErr.FileID], appErr)
-			h.fileErrorsMu.Unlock()
+		if appErr.FileID != -1 && len(fileErrorsMap.errors) < 100 {
+			fileErrorsMap.mu.Lock()
+			fileErrorsMap.errors[appErr.FileID] = append(fileErrorsMap.errors[appErr.FileID], appErr)
+			fileErrorsMap.mu.Unlock()
 		} else if appErr.FileID != -1 {
 			// File has too many errors, skip it, and log for manual inspection
 			log.Printf("File %d has too many errors, skipping\n", appErr.FileID)
@@ -184,30 +222,31 @@ func (h *ExtractionHandler) ErrorWorker() {
 }
 
 // FileStatusWorker updates the final status of each processed file based on whether errors occurred.
-func (h *ExtractionHandler) setupDatabase(fileInfos []models.FileInfo) func() {
+func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo) func() {
 	// Create database tables
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
 
 	// Build a set of unique dates from the file information.
 	uniqueDates := make(map[time.Time]struct{})
-	for _, fileInfo := range fileInfos {
+	for _, fileInfo := range fileInfoList {
 		normalizedDate := fileInfo.ReferenceDate.Truncate(24 * time.Hour)
 		uniqueDates[normalizedDate] = struct{}{}
 	}
 	log.Printf("Found %d unique dates. Ensuring partitions exist...", len(uniqueDates))
 
-	// Synchronously create all required partitions before processing starts.
 	for date := range uniqueDates {
 		exists, err := h.dbManager.CheckIfPartitionExists(date)
 		if err != nil {
 			log.Fatalf("Failed to check for partition for date %s: %v", date.Format("2006-01-02"), err)
+			panic(err) // Fatal cannot continue
 		}
 
 		if !exists {
 			if err := h.dbManager.CreatePartitionForDate(date); err != nil {
 				// If partition creation fails, it's a fatal error as ingestion will fail.
 				log.Fatalf("Failed to create partition for date %s: %v", date.Format("2006-01-02"), err)
+				panic(err) // Fatal cannot continue
 			}
 		} else {
 			log.Printf("Partition for date %s already exists. Skipping creation.", date.Format("2006-01-02"))
@@ -216,10 +255,11 @@ func (h *ExtractionHandler) setupDatabase(fileInfos []models.FileInfo) func() {
 
 	// Create staging tables for each DB worker and collect their names for cleanup.
 	var stagingTableNames []string
-	for w := 1; w <= h.numDBWorkers; w++ {
+	for w := 1; w <= h.config.numDBWorkers; w++ {
 		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", w)
 		if err := h.dbManager.CreateWorkerStagingTable(stagingTableName); err != nil {
 			log.Fatalf("Failed to create staging table for worker %d: %v", w, err)
+			panic(err) // Fatal cannot continue
 		}
 		stagingTableNames = append(stagingTableNames, stagingTableName)
 	}
@@ -234,14 +274,14 @@ func (h *ExtractionHandler) setupDatabase(fileInfos []models.FileInfo) func() {
 }
 
 // FileStatusWorker updates the final status of each processed file based on whether errors occurred.
-func (h *ExtractionHandler) FileStatusWorker(processedFiles map[int]string) {
-	defer h.errorWg.Done()
+func (h *ExtractionHandler) FileStatusWorker(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups, fileMap *FileMap) {
+	defer waitGroups.errorWg.Done()
 
-	h.fileErrorsMu.Lock()
-	defer h.fileErrorsMu.Unlock()
+	fileErrorsMap.mu.Lock()
+	defer fileErrorsMap.mu.Unlock()
 
-	for fileID := range processedFiles {
-		appErrors := h.fileErrors[fileID]
+	for fileID := range *fileMap {
+		appErrors := fileErrorsMap.errors[fileID]
 		status := db.FILE_STATUS_DONE
 		if len(appErrors) > 0 {
 			status = db.FILE_STATUS_DONE_WITH_ERRORS
@@ -282,23 +322,23 @@ func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.Fil
 }
 
 // startWorkers initializes and starts all the worker pools (parser, DB, error).
-func (h *ExtractionHandler) startWorkers() {
+func (h *ExtractionHandler) startWorkers(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
 	// Start the error worker
-	h.errorWg.Add(1)
-	go h.ErrorWorker()
+	waitGroups.errorWg.Add(1)
+	go h.ErrorWorker(channels, fileErrorsMap, waitGroups)
 
 	// Start parser workers
-	for w := 1; w <= h.numParserWorkers; w++ {
-		h.parserWg.Add(1)
-		go h.ParserWorker()
+	for w := 1; w <= h.config.numParserWorkers; w++ {
+		waitGroups.parserWg.Add(1)
+		go h.ParserWorker(channels, fileErrorsMap, waitGroups)
 	}
 
 	// Start DB workers
-	for w := 1; w <= h.numDBWorkers; w++ {
+	for w := 1; w <= h.config.numDBWorkers; w++ {
 		workerId := w
 		stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
 		// The staging table is already created in the Extract method.
-		h.dbWg.Add(1)
-		go h.DBWorker(w, stagingTableName)
+		waitGroups.dbWg.Add(1)
+		go h.DBWorker(w, stagingTableName, channels, waitGroups)
 	}
 }

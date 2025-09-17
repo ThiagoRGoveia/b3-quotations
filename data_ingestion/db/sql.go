@@ -247,8 +247,43 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors a
 	return nil
 }
 
-// InsertMultipleTrades inserts multiple trade records using the bulk load, filter, and insert pattern.
-func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error {
+// FindFileRecordByChecksum finds a file record by its checksum.
+func (m *PostgresDBManager) FindFileRecordByChecksum(checksum string) (*models.FileRecord, error) {
+	query := `
+	SELECT id, file_name, processed_at, status, checksum, reference_date, errors
+	FROM file_records
+	WHERE checksum = $1;`
+
+	fileRecord := &models.FileRecord{}
+	var errors []byte // Use a byte slice for the JSON field
+
+	err := m.dbpool.QueryRow(m.ctx, query, checksum).Scan(
+		&fileRecord.ID,
+		&fileRecord.FileName,
+		&fileRecord.ProcessedAt,
+		&fileRecord.Status,
+		&fileRecord.Checksum,
+		&fileRecord.ReferenceDate,
+		&errors,
+	)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil // Not found, but not an error
+		}
+		return nil, fmt.Errorf("error finding file record by checksum: %v", err)
+	}
+
+	// Only set errors if not null
+	if errors != nil {
+		fileRecord.Errors = errors
+	}
+
+	return fileRecord, nil
+}
+
+func (m *PostgresDBManager) CopyTradesIntoStagingTable(trades []*models.Trade, stagingTableName string) error {
+
 	// Step 1: Bulk load into the worker's assigned staging table.
 	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
 	_, err := m.dbpool.CopyFrom(
@@ -261,6 +296,18 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, staging
 		}),
 	)
 
+	if err != nil {
+		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
+	}
+
+	return nil
+}
+
+// InsertMultipleTrades inserts multiple trade records using the bulk load, filter, and insert pattern.
+func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error {
+	// Step 1: Bulk load into the worker's assigned staging table.
+	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
+	err := m.CopyTradesIntoStagingTable(trades, stagingTableName)
 	if err != nil {
 		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
 	}
@@ -290,6 +337,60 @@ func (m *PostgresDBManager) InsertMultipleTrades(trades []*models.Trade, staging
 	if err != nil {
 		// This is not a fatal error for the data itself, but should be logged as a warning.
 		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
+	}
+
+	return nil
+}
+
+// InsertAllStagingTableData inserts all data from a staging table into trade_records without checking for duplicates.
+func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error {
+	// Step 1: Bulk load into the worker's assigned staging table.
+	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
+	err := m.CopyTradesIntoStagingTable(trades, stagingTableName)
+	if err != nil {
+		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
+	}
+
+	// Step 2: Insert all data from the staging table to the main table
+	insertQuery := fmt.Sprintf(`
+	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
+	SELECT hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
+	FROM %s;
+	`, pgx.Identifier{stagingTableName}.Sanitize())
+
+	log.Printf("Inserting all data from staging table %s to main table.", stagingTableName)
+	_, err = m.dbpool.Exec(m.ctx, insertQuery)
+	if err != nil {
+		return fmt.Errorf("error inserting all data from staging table %s: %v", stagingTableName, err)
+	}
+
+	return nil
+}
+
+// InsertDiffFromStagingTable inserts the difference between staging table data and trade_records
+// using a CTE to identify records in the staging table that are not in trade_records by hash value.
+func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error {
+	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
+	err := m.CopyTradesIntoStagingTable(trades, stagingTableName)
+	if err != nil {
+		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
+	}
+	insertDiffQuery := fmt.Sprintf(`
+	WITH staging_diff AS (
+		SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
+		FROM %s s
+		LEFT JOIN trade_records t ON t.hash = s.hash AND t.reference_date = s.reference_date
+		WHERE t.hash IS NULL
+	)
+	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
+	SELECT hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
+	FROM staging_diff;
+	`, pgx.Identifier{stagingTableName}.Sanitize())
+
+	log.Printf("Inserting differences from staging table %s to main table using CTE.", stagingTableName)
+	_, err = m.dbpool.Exec(m.ctx, insertDiffQuery)
+	if err != nil {
+		return fmt.Errorf("error inserting differences from staging table %s: %v", stagingTableName, err)
 	}
 
 	return nil
