@@ -20,7 +20,7 @@ type DBManager interface {
 	InsertMultipleTrades(trades []*models.Trade, stagingTableName string) error
 	CheckIfPartitionExists(date time.Time) (bool, error)
 	CreatePartitionForDate(date time.Time) error
-	CreatePartitionsForDates(dates []time.Time) error
+	CreatePartitionsForDates(dates []time.Time) (*FirstWritePartition, error)
 	InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error
 	InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error
 	CopyTradesIntoStagingTable(trades []*models.Trade, stagingTableName string) error

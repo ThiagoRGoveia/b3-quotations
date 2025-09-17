@@ -17,6 +17,8 @@ type PostgresDBManager struct {
 	ctx    context.Context
 }
 
+type FirstWritePartition map[time.Time]bool
+
 func NewPostgresDBManager(ctx context.Context, pool *pgxpool.Pool) *PostgresDBManager {
 	return &PostgresDBManager{dbpool: pool, ctx: ctx}
 }
@@ -297,10 +299,10 @@ func (m *PostgresDBManager) isPartitionAlreadyExistsError(err error) bool {
 }
 
 // CreatePartitionsForDates creates partitions for multiple dates in a single transaction
-func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
+func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstWritePartition, error) {
 	if len(dates) == 0 {
 		// Nothing to do
-		return nil
+		return nil, nil
 	}
 
 	// Generate all the table names first
@@ -315,7 +317,7 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
 	// Begin a transaction
 	tx, err := m.dbpool.Begin(m.ctx)
 	if err != nil {
-		return fmt.Errorf("error beginning transaction: %v", err)
+		return nil, fmt.Errorf("error beginning transaction: %v", err)
 	}
 
 	// Check which tables already exist with a single query
@@ -340,7 +342,7 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
 		if rx != nil {
 			log.Printf("Error rolling back transaction: %v", rx)
 		}
-		return fmt.Errorf("error checking existing partitions: %w", err)
+		return nil, fmt.Errorf("error checking existing partitions: %w", err)
 	}
 
 	// Map existing table names
@@ -352,7 +354,7 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
 			if rx != nil {
 				log.Printf("Error rolling back transaction: %v", rx)
 			}
-			return fmt.Errorf("error scanning tablename: %w", err)
+			return nil, fmt.Errorf("error scanning tablename: %w", err)
 		}
 		existingTables[tableName] = true
 	}
@@ -363,7 +365,7 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
 		if rx != nil {
 			log.Printf("Error rolling back transaction: %v", rx)
 		}
-		return fmt.Errorf("error iterating over rows: %w", err)
+		return nil, fmt.Errorf("error iterating over rows: %w", err)
 	}
 
 	// Create partitions for dates where tables don't exist
@@ -390,7 +392,7 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
 						// Just log rollback errors, return the original error
 						log.Printf("Error rolling back transaction: %v", rx)
 					}
-					return fmt.Errorf("error creating partition %s: %w", tableName, err)
+					return nil, fmt.Errorf("error creating partition %s: %w", tableName, err)
 				}
 				log.Printf("Partition %s already exists, skipping creation.", tableName)
 			}
@@ -401,10 +403,15 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) error {
 
 	// Commit the transaction
 	if err := tx.Commit(m.ctx); err != nil {
-		return fmt.Errorf("error committing transaction: %v", err)
+		return nil, fmt.Errorf("error committing transaction: %v", err)
 	}
 
-	return nil
+	// return created partition dates
+	createdPartitions := make(FirstWritePartition)
+	for _, date := range dates {
+		createdPartitions[date] = true
+	}
+	return &createdPartitions, nil
 }
 
 // InsertFileRecord inserts a new file record into the file_records table.

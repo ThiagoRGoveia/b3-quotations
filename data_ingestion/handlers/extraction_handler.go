@@ -69,7 +69,7 @@ func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWor
 	}
 }
 
-func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap) {
+func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap, *db.FirstWritePartition, error) {
 	// Step 0.1: Setup channels, waitgroups, file map, and error map.
 	jobs := make(chan models.FileProcessingJob, 100)
 	errors := make(chan models.AppError, 100)
@@ -89,11 +89,15 @@ func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *Extra
 	fileInfo, err := h.buildDatesSetAndFiles(filesPath)
 	if err != nil {
 		log.Fatalf("Failed to scan files: %v", err)
-		panic(err)
+		return nil, nil, nil, nil, nil, err
 	}
 
 	// Step 0.3: Setup the database and get the cleanup function.
-	cleanup := h.setupDatabase(fileInfo, &channels)
+	cleanup, createdPartitions, err := h.setupDatabase(fileInfo, &channels)
+	if err != nil {
+		log.Fatalf("Failed to setup database: %v", err)
+		return nil, nil, nil, nil, nil, err
+	}
 	defer cleanup()
 	log.Println("Database setup complete. All necessary tables and partitions are ready.")
 
@@ -103,16 +107,19 @@ func (h *ExtractionHandler) setup(filesPath string) (*ExtractionChannels, *Extra
 
 	// Step 0.5: Start all worker pools.
 	log.Println("Starting worker pools...")
-	return &channels, &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg}, &fileMap, &fileErrorsMap
+	return &channels, &ExtractionWaitGroups{parserWg: &parserWg, dbWg: &dbWg, errorWg: &errorWg}, &fileMap, &fileErrorsMap, createdPartitions, nil
 }
 
 // Execute orchestrates the file processing workflow.
 func (h *ExtractionHandler) Execute(filesPath string) error {
 	// Step 0: Setup the extraction environment.
-	channels, waitGroups, fileMap, fileErrorsMap := h.setup(filesPath)
+	channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, err := h.setup(filesPath)
+	if err != nil {
+		return err
+	}
 
 	// Step 1: Start the concurrent workers.
-	h.startWorkers(channels, fileErrorsMap, waitGroups)
+	h.startWorkers(channels, fileErrorsMap, waitGroups, createdPartitions)
 
 	// Step 2: Wait for all processing to complete.
 	log.Println("Waiting for all workers to finish...")
@@ -138,10 +145,6 @@ func (h *ExtractionHandler) Execute(filesPath string) error {
 	log.Println("Extraction process finished.")
 	return nil
 }
-
-// wip dont remove
-func (h *ExtractionHandler) handleNewReferenceDate()      {}
-func (h *ExtractionHandler) handleExistingReferenceDate() {}
 
 func (h *ExtractionHandler) preprocessFile(fileInfo []models.FileInfo, fileMap *FileMap, channels *ExtractionChannels) {
 	for _, fileInfo := range fileInfo {
@@ -177,7 +180,7 @@ func (h *ExtractionHandler) parserWorker(channels *ExtractionChannels, waitGroup
 }
 
 // dbWorker processes trades from a specific date channel and inserts them into the database in batches.
-func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, resultsChan <-chan *models.Trade, errorsChan chan<- models.AppError, waitGroups *ExtractionWaitGroups) {
+func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, resultsChan <-chan *models.Trade, errorsChan chan<- models.AppError, waitGroups *ExtractionWaitGroups, createdPartitions *db.FirstWritePartition) {
 	defer waitGroups.dbWg.Done()
 	trades := make([]*models.Trade, 0, h.config.dbBatchSize)
 
@@ -185,8 +188,13 @@ func (h *ExtractionHandler) dbWorker(workerId int, stagingTableName string, resu
 		trades = append(trades, result)
 		if len(trades) >= h.config.dbBatchSize {
 			log.Printf("DB Worker %d: Inserting batch of %d trades using table %s\n", workerId, len(trades), stagingTableName)
-			// Using the DB manager's stored context
-			err := h.dbManager.InsertMultipleTrades(trades, stagingTableName)
+			var err error
+			if (*createdPartitions)[trades[0].ReferenceDate] {
+				//empty partition can benefit for insert without checks
+				err = h.dbManager.InsertAllStagingTableData(trades, stagingTableName)
+			} else {
+				err = h.dbManager.InsertDiffFromStagingTable(trades, stagingTableName)
+			}
 			if err != nil {
 				// The batch failed, so report an error for each unique FileID in the batch.
 				fileIDs := make(map[int]bool)
@@ -239,7 +247,7 @@ func (h *ExtractionHandler) errorWorker(channels *ExtractionChannels, fileErrors
 }
 
 // FileStatusWorker updates the final status of each processed file based on whether errors occurred.
-func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channels *ExtractionChannels) func() {
+func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channels *ExtractionChannels) (func(), *db.FirstWritePartition, error) {
 	// Create database tables // TEMP move this into docker setup
 	h.dbManager.CreateFileRecordsTable()
 	h.dbManager.CreateTradeRecordsTable()
@@ -265,9 +273,10 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channe
 	}
 
 	// Create all needed partitions in a single transaction
-	if err := h.dbManager.CreatePartitionsForDates(dates); err != nil {
+	createdPartitions, err := h.dbManager.CreatePartitionsForDates(dates)
+	if err != nil {
 		log.Fatalf("Failed to create partitions: %v", err)
-		panic(err) // Fatal cannot continue
+		return nil, createdPartitions, err
 	}
 
 	// Calculate the total number of DB workers (numDates * numDBWorkersPerDate)
@@ -278,7 +287,7 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channe
 	stagingTableNames, err := h.dbManager.CreateWorkerStagingTables(totalDBWorkers)
 	if err != nil {
 		log.Fatalf("Failed to create staging tables: %v", err)
-		panic(err) // Fatal cannot continue
+		return nil, createdPartitions, err
 	}
 
 	// Return a cleanup function to be deferred by the caller.
@@ -287,7 +296,7 @@ func (h *ExtractionHandler) setupDatabase(fileInfoList []models.FileInfo, channe
 			log.Printf("Cleaning up staging table %s", tableName)
 			h.dbManager.DropWorkerStagingTable(tableName)
 		}
-	}
+	}, createdPartitions, nil
 }
 
 // fileStatusWorker updates the final status of each processed file based on whether errors occurred.
@@ -340,7 +349,7 @@ func (h *ExtractionHandler) buildDatesSetAndFiles(rootPath string) ([]models.Fil
 }
 
 // startWorkers initializes and starts all the worker pools (parser, DB, error).
-func (h *ExtractionHandler) startWorkers(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups) {
+func (h *ExtractionHandler) startWorkers(channels *ExtractionChannels, fileErrorsMap *FileErrorMap, waitGroups *ExtractionWaitGroups, createdPartitions *db.FirstWritePartition) {
 	// Step 1.0: Start the error worker
 	waitGroups.errorWg.Add(1)
 	go h.errorWorker(channels, fileErrorsMap, waitGroups)
@@ -364,7 +373,7 @@ func (h *ExtractionHandler) startWorkers(channels *ExtractionChannels, fileError
 			// The staging table is already created in the setupDatabase method
 			waitGroups.dbWg.Add(1)
 			log.Printf("Starting DB worker %d for date %s using table %s", workerId, formattedDate, stagingTableName)
-			go h.dbWorker(workerId, stagingTableName, resultsChan, channels.errors, waitGroups)
+			go h.dbWorker(workerId, stagingTableName, resultsChan, channels.errors, waitGroups, createdPartitions)
 			workerCounter++
 		}
 	}
