@@ -462,3 +462,38 @@ func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, s
 
 	return tx.Commit(m.ctx)
 }
+
+func (m *PostgresDBManager) GetTickerInfo(ticker string, startDate time.Time) (*models.TickerInfo, error) {
+	info := &models.TickerInfo{Ticker: ticker}
+
+	query := `
+		WITH filtered_trades AS (
+    SELECT
+        price,
+        quantity,
+        transaction_date
+    FROM
+        trade_records
+    WHERE
+        ticker = $1 AND transaction_date >= $2
+		),
+		daily_volumes AS (
+				SELECT
+						DATE(transaction_date) AS trade_date,
+						SUM(quantity) AS total_volume
+				FROM
+						filtered_trades
+				GROUP BY
+						trade_date
+		)
+		SELECT
+				(SELECT COALESCE(MAX(price), 0) FROM filtered_trades) AS max_range_value,
+				(SELECT COALESCE(MAX(total_volume), 0) FROM daily_volumes) AS max_daily_volume;`
+
+	err := m.dbpool.QueryRow(m.ctx, query, ticker, startDate).Scan(&info.MaxRangeValue, &info.MaxDailyVolume)
+	if err != nil {
+		return nil, fmt.Errorf("error querying ticker info: %w", err)
+	}
+
+	return info, nil
+}

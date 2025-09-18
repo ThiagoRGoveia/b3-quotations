@@ -109,3 +109,9 @@ type SetupReturn struct {
 func (s *SetupReturn) GetValues() ([]FileInfo, *ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap, *FirstWritePartition, func()) {
 	return s.FileInfo, s.Channels, s.WaitGroups, s.FileMap, s.FileErrorsMap, s.CreatedPartitions, s.Cleanup
 }
+
+type TickerInfo struct {
+	Ticker         string  `json:"ticker"`
+	MaxRangeValue  float64 `json:"max_range_value"`
+	MaxDailyVolume int64   `json:"max_daily_volume"`
+}

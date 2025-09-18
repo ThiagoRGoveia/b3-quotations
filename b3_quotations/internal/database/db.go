@@ -19,4 +19,5 @@ type DBManager interface {
 	InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error
 	InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error
 	IsFileAlreadyProcessed(checksum string) (bool, error)
+	GetTickerInfo(ticker string, startDate time.Time) (*models.TickerInfo, error)
 }
