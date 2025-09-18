@@ -345,7 +345,7 @@ func (m *PostgresDBManager) IsFileAlreadyProcessed(checksum string) (bool, error
 	query := `
 	SELECT id
 	FROM file_records
-	WHERE checksum = $1;`
+	WHERE checksum = $1 AND status = 'DONE';`
 
 	var id int
 
@@ -475,7 +475,7 @@ func (m *PostgresDBManager) GetTickerInfo(ticker string, startDate time.Time) (*
     FROM
         trade_records
     WHERE
-        ticker = $1 AND transaction_date >= $2
+        ticker = $1 AND transaction_date >= $2 AND reference_date >= $2
 		),
 		daily_volumes AS (
 				SELECT
