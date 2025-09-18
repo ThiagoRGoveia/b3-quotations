@@ -1,4 +1,10 @@
-DATABASE_URL=postgresql://tradeuser:tradepassword@localhost:5432/tradedb
+# For Go applications to connect to the database inside Docker
+DATABASE_URL=postgresql://tradeuser:tradepassword@postgres:5432/tradedb
+
+# For Postgres container initialization
+POSTGRES_USER=tradeuser
+POSTGRES_PASSWORD=tradepassword
+POSTGRES_DB=tradedb
 NUM_PARSER_WORKERS=7
 NUM_DB_WORKERS_PER_DATE=2
 RESULTS_CHANNEL_SIZE=500000

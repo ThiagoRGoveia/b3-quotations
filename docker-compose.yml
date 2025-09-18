@@ -1,16 +1,26 @@
+x-app-base: &app-base
+  build: .
+  env_file:
+    - .env
+  depends_on:
+    - postgres
+
 services:
   postgres:
     image: postgres:17-alpine
     container_name: trade_postgres_db
-    environment:
-      POSTGRES_USER: tradeuser
-      POSTGRES_PASSWORD: tradepassword
-      POSTGRES_DB: tradedb
+    env_file:
+      - .env
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     command:
       - "-c"
       - "maintenance_work_mem=4GB"
@@ -21,6 +31,30 @@ services:
       - "-c"
       - "checkpoint_completion_target=0.9"
 
+  setup:
+    <<: *app-base
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ./setup
+
+  data_ingestion:
+    <<: *app-base
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./files:/app/files
+
+  api:
+    <<: *app-base
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    command: ./api
+    restart: always
 
 volumes:
   postgres_data:

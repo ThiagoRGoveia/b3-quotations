@@ -1,11 +1,30 @@
-setup:
-	@cp env-example .env
-	@docker compose up -d
+.PHONY: start stop setup ingest clean-db
+
+# Default path for data ingestion if not provided
+FILES_PATH ?= files
+
+start:
+	@echo "Starting services..."
+	@cp -n env-example .env || true
+	@docker compose up -d --build api postgres
+	@echo "Services started."
+
+stop:
+	@echo "Stopping services..."
+	@docker compose down
+	@echo "Services stopped."
+
+setup: start
 	@echo "Running database setup..."
-	@go run cmd/setup/main.go
+	@docker compose run --rm setup
 	@echo "Database setup finished."
+
+ingest:
+	@echo "Starting data ingestion from $(FILES_PATH)..."
+	@docker compose run --rm data_ingestion ./data_ingestion $(FILES_PATH)
+	@echo "Data ingestion finished."
 
 clean-db:
 	@echo "Stopping services and removing docker volume..."
-	@docker-compose -f ./docker-compose.yml down --volumes
+	@docker compose down --volumes
 	@echo "Docker volume removed."
