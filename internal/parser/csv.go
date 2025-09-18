@@ -131,7 +131,7 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 		resultsChan, exists := dateChannels[trade.ReferenceDate.Truncate(24*time.Hour)]
 		if !exists {
 			errors <- models.AppError{FileID: fileID, Message: "No channel found for reference date", Err: fmt.Errorf("missing channel for date: %v", trade.ReferenceDate), Trade: trade}
-			log.Fatalf("No channel found for reference date: %v, File ID: %d may be malformed", trade.ReferenceDate, fileID)
+			log.Printf("No channel found for reference date: %v, File ID: %d may be malformed", trade.ReferenceDate, fileID)
 			continue
 		}
 

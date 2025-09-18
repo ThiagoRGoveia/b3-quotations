@@ -40,6 +40,7 @@ func setup() (string, *ingestion.IngestionService, func(), error) {
 
 	handler := ingestion.NewIngestionService(
 		dbManager,
+		&ingestion.Setup{},
 		asyncWorker,
 		fileProcessor,
 		*cfg,

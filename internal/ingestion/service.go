@@ -2,7 +2,6 @@ package ingestion
 
 import (
 	"log"
-	"sync"
 	"time"
 
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/config"
@@ -12,14 +11,16 @@ import (
 
 type IngestionService struct {
 	dbManager     database.DBManager
+	setupService  ISetup
 	asyncWorker   Worker
 	fileProcessor Processor
 	config        config.Config
 }
 
-func NewIngestionService(dbManager database.DBManager, worker Worker, processor Processor, cfg config.Config) *IngestionService {
+func NewIngestionService(dbManager database.DBManager, setupService ISetup, worker Worker, processor Processor, cfg config.Config) *IngestionService {
 	return &IngestionService{
 		dbManager:     dbManager,
+		setupService:  setupService,
 		asyncWorker:   worker,
 		fileProcessor: processor,
 		config:        cfg,
@@ -29,25 +30,39 @@ func NewIngestionService(dbManager database.DBManager, worker Worker, processor 
 // Execute orchestrates the file processing workflow.
 func (h *IngestionService) Execute(filesPath string) error {
 	// Step 0: Setup the extraction environment.
-	setupReturn, err := h.setup(filesPath)
+	environmentConfig, err := h.setupService.build()
 
 	if err != nil {
 		return err
 	}
 
-	// Step 0.1: Drop indexes before starting for efficiency
-	log.Println("Dropping trade record indexes...")
-	h.dbManager.DropTradeRecordIndexes()
-	// Step 0.2: Make sure indexes are created after the process
+	channels, waitGroups, fileMap, fileErrorsMap := environmentConfig.GetValues()
+	// Step 0.1: Setup the extraction environment.
+	log.Println("Scanning files to determine required partitions...")
+	referenceDates, err := h.fileProcessor.ScanForFiles(filesPath)
+	if err != nil {
+		log.Printf("Failed to scan files: %v", err)
+		return err
+	}
+
+	// Step 0.2: Setup the database and get the cleanup function.
+	cleanup, createdPartitions, err := h.setupDatabase(referenceDates, channels)
+	if err != nil {
+		log.Printf("Failed to setup database: %v", err)
+		return err
+	}
+	defer cleanup()
 	defer func() {
 		log.Println("Re-creating trade record indexes...")
 		h.dbManager.CreateTradeRecordIndexes()
 	}()
 
-	fileInfo, channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, cleanup := setupReturn.GetValues()
-	defer cleanup()
+	// Step 0.3: Drop indexes before starting for efficiency
+	log.Println("Dropping trade record indexes...")
+	h.dbManager.DropTradeRecordIndexes()
+	// Step 0.4: Make sure indexes are created after the process
 
-	// Step 0.3: Setup the async worker channels and wait groups VERY IMPORTANT: can cause panic if not done
+	// Step 0.5: Setup the async worker channels and wait groups VERY IMPORTANT: can cause panic if not done
 	h.asyncWorker.WithChannels(channels).WithWaitGroups(waitGroups)
 
 	// Step 1: Preprocess files and send jobs to the parser workers.
@@ -55,10 +70,16 @@ func (h *IngestionService) Execute(filesPath string) error {
 	// - Calculates check sum for files and checks if they are already processed
 	// - Saves file record to db
 	// This is done in a goroutine to allow the main flow to continue with worker setup.
-	go h.fileProcessor.PreprocessAndDispatchJobs(fileInfo, *fileMap, channels.Jobs)
+	// Sharing MainWg with error worker
+	dispatcherWorkerRunner, _, err := h.asyncWorker.SetupJobDispatcherWorker(referenceDates, *fileMap)
+	if err != nil {
+		return err
+	}
+	dispatcherWorkerRunner.Run()
 
 	// Step 2: Setup the error worker, this worker will handle async errors from the extraction process
-	errorWorkerRunner, errorWorkerWaitGroup, err := h.asyncWorker.SetupErrorWorker()
+	// Sharing MainWg with dispatcher worker
+	errorWorkerRunner, mainWaitGroup, err := h.asyncWorker.SetupErrorWorker()
 	if err != nil {
 		return err
 	}
@@ -119,53 +140,13 @@ func (h *IngestionService) Execute(filesPath string) error {
 
 	// Step 6.4: Wait for file error worker to finish
 	log.Println("Waiting for file error worker to finish...")
-	errorWorkerWaitGroup.Wait()
+	mainWaitGroup.Wait()
 
 	// Step 7: Update each file record with status of operation and errors with results from o
 	h.fileProcessor.UpdateFileStatus(fileErrorsMap, fileMap)
 
 	log.Println("Extraction process finished.")
 	return nil
-}
-
-func (h *IngestionService) setup(filesPath string) (models.SetupReturn, error) {
-	// Step 0.1: Setup channels, waitgroups, file map, and error map.
-	jobs := make(chan models.FileProcessingJob, 100)
-	errors := make(chan models.AppError, 100)
-
-	channels := models.ExtractionChannels{
-		Results: make(map[time.Time]chan *models.Trade),
-		Errors:  errors,
-		Jobs:    jobs,
-	}
-
-	var parserWg, dbWg, errorWg sync.WaitGroup
-	fileMap := make(map[int]string)
-	fileErrorsMap := models.FileErrorMap{Errors: make(map[int][]models.AppError)}
-	// Step 0.2: Synchronously get all file paths and their reference dates.
-	log.Println("Scanning files to determine required partitions...")
-	referenceDates, err := h.fileProcessor.ScanForFiles(filesPath)
-	if err != nil {
-		log.Fatalf("Failed to scan files: %v", err)
-		return models.SetupReturn{}, err
-	}
-
-	// Step 0.3: Setup the database and get the cleanup function.
-	cleanup, createdPartitions, err := h.setupDatabase(referenceDates, &channels)
-	if err != nil {
-		log.Fatalf("Failed to setup database: %v", err)
-		return models.SetupReturn{}, err
-	}
-
-	return models.SetupReturn{
-		FileInfo:          referenceDates,
-		Channels:          &channels,
-		WaitGroups:        &models.ExtractionWaitGroups{ParserWg: &parserWg, DbWg: &dbWg, ErrorWg: &errorWg},
-		FileMap:           &fileMap,
-		FileErrorsMap:     &fileErrorsMap,
-		CreatedPartitions: createdPartitions,
-		Cleanup:           cleanup,
-	}, nil
 }
 
 func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channels *models.ExtractionChannels) (func(), *models.FirstWritePartition, error) {
@@ -192,7 +173,7 @@ func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channel
 	// Create all needed partitions based in the unique dates processed
 	createdPartitions, err := h.dbManager.CreatePartitionsForDates(dates)
 	if err != nil {
-		log.Fatalf("Failed to create partitions: %v", err)
+		log.Printf("Failed to create partitions: %v", err)
 		return nil, createdPartitions, err
 	}
 
@@ -203,7 +184,7 @@ func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channel
 	// Create staging tables for each DB worker to work in isolation
 	stagingTableNames, err := h.dbManager.CreateWorkerStagingTables(totalDBWorkers)
 	if err != nil {
-		log.Fatalf("Failed to create staging tables: %v", err)
+		log.Printf("Failed to create staging tables: %v", err)
 		return nil, createdPartitions, err
 	}
 

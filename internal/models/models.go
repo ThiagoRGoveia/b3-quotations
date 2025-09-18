@@ -84,7 +84,7 @@ type ExtractionChannels struct {
 type ExtractionWaitGroups struct {
 	ParserWg *sync.WaitGroup
 	DbWg     *sync.WaitGroup
-	ErrorWg  *sync.WaitGroup
+	MainWg   *sync.WaitGroup
 }
 
 type Config struct {
@@ -97,17 +97,14 @@ type Config struct {
 type FileMap = map[int]string
 
 type SetupReturn struct {
-	FileInfo          []FileInfo
-	Channels          *ExtractionChannels
-	WaitGroups        *ExtractionWaitGroups
-	FileMap           *FileMap
-	FileErrorsMap     *FileErrorMap
-	CreatedPartitions *FirstWritePartition
-	Cleanup           func()
+	Channels      *ExtractionChannels
+	WaitGroups    *ExtractionWaitGroups
+	FileMap       *FileMap
+	FileErrorsMap *FileErrorMap
 }
 
-func (s *SetupReturn) GetValues() ([]FileInfo, *ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap, *FirstWritePartition, func()) {
-	return s.FileInfo, s.Channels, s.WaitGroups, s.FileMap, s.FileErrorsMap, s.CreatedPartitions, s.Cleanup
+func (s *SetupReturn) GetValues() (*ExtractionChannels, *ExtractionWaitGroups, *FileMap, *FileErrorMap) {
+	return s.Channels, s.WaitGroups, s.FileMap, s.FileErrorsMap
 }
 
 type TickerInfo struct {

@@ -5,9 +5,12 @@ import (
 	"log"
 	"sync"
 
+	"time"
+
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/database"
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/models"
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/parser"
+	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/pkg/checksum"
 )
 
 type Runner[T any] struct {
@@ -26,6 +29,7 @@ type Worker interface {
 	SetupErrorWorker() (Runner[func(*models.FileErrorMap)], *sync.WaitGroup, error)
 	SetupParserWorkers(numberOfWorkers int) (Runner[func()], *sync.WaitGroup, error)
 	SetupDBWorkers(numDBWorkersPerReferenceDate int) (Runner[func(func(*[]*models.Trade, string) error) error], *sync.WaitGroup, error)
+	SetupJobDispatcherWorker(fileInfos []models.FileInfo, fileMap map[int]string) (Runner[func()], *sync.WaitGroup, error)
 }
 
 type AsyncWorker struct {
@@ -139,7 +143,7 @@ func (w *AsyncWorker) SetupDBWorkers(numDBWorkersPerReferenceDate int) (Runner[f
 }
 
 func (w *AsyncWorker) ErrorWorker(fileErrorsMap *models.FileErrorMap) {
-	defer w.waitGroups.ErrorWg.Done()
+	defer w.waitGroups.MainWg.Done()
 	for appErr := range w.channels.Errors {
 		log.Printf("Caught error: %s\n", appErr.Error())
 		// limit the number of errors per file to prevent memory overflow, if more than 100 errors are collected, then file is probably malformed
@@ -154,11 +158,63 @@ func (w *AsyncWorker) ErrorWorker(fileErrorsMap *models.FileErrorMap) {
 	}
 }
 
+func (w *AsyncWorker) PreprocessAndDispatchJobs(
+	fileInfos []models.FileInfo,
+	fileMap map[int]string,
+) {
+	defer close(w.channels.Jobs)
+	defer w.waitGroups.MainWg.Done()
+
+	for _, fileInfo := range fileInfos {
+		checksum, err := checksum.GetFileChecksum(fileInfo.Path)
+		if err != nil {
+			log.Printf("ERROR: Failed to calculate checksum for %s: %v. Skipping file.", fileInfo.Path, err)
+			continue
+		}
+
+		isProcessed, err := w.dbManager.IsFileAlreadyProcessed(checksum)
+		if err != nil {
+			log.Printf("ERROR: Failed to check if file %s is already processed: %v. Skipping file.", fileInfo.Path, err)
+			continue
+		}
+		if isProcessed {
+			log.Printf("INFO: File %s (checksum: %s) has already been processed. Skipping.", fileInfo.Path, checksum)
+			continue
+		}
+
+		fileID, err := w.dbManager.InsertFileRecord(
+			fileInfo.Path,
+			time.Now(),
+			database.FILE_STATUS_PROCESSING,
+			checksum,
+			fileInfo.ReferenceDate,
+		)
+		if err != nil {
+			log.Printf("ERROR: Failed to insert file record for %s: %v. Skipping file.", fileInfo.Path, err)
+			continue
+		}
+
+		fileMap[fileID] = fileInfo.Path
+
+		log.Printf("Dispatching job for file: %s (FileID: %d)", fileInfo.Path, fileID)
+		w.channels.Jobs <- models.FileProcessingJob{FilePath: fileInfo.Path, FileID: fileID}
+	}
+}
+
+func (w *AsyncWorker) SetupJobDispatcherWorker(fileInfos []models.FileInfo, fileMap map[int]string) (Runner[func()], *sync.WaitGroup, error) {
+	return Runner[func()]{
+		Run: func() {
+			w.waitGroups.MainWg.Add(1)
+			go w.PreprocessAndDispatchJobs(fileInfos, fileMap)
+		},
+	}, w.waitGroups.MainWg, nil
+}
+
 func (w *AsyncWorker) SetupErrorWorker() (Runner[func(*models.FileErrorMap)], *sync.WaitGroup, error) {
 	return Runner[func(*models.FileErrorMap)]{
 		Run: func(fileErrorsMap *models.FileErrorMap) {
-			w.waitGroups.ErrorWg.Add(1)
+			w.waitGroups.MainWg.Add(1)
 			go w.ErrorWorker(fileErrorsMap)
 		},
-	}, w.waitGroups.ErrorWg, nil
+	}, w.waitGroups.MainWg, nil
 }
