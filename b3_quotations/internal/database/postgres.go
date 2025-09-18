@@ -50,6 +50,8 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	return nil
 }
 
+// CreateTradeRecordsTable creates the trade_records partition table. The partitions are split daily and will
+// hold approx 8M records each
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_records (
@@ -62,7 +64,7 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 		quantity BIGINT NOT NULL,
 		closing_time VARCHAR(50) NOT NULL,
 		file_id INTEGER,
-		hash VARCHAR(32) NOT NULL
+		checksum VARCHAR(64) NOT NULL
 	) PARTITION BY RANGE (reference_date); 
 	`
 	_, err := m.dbpool.Exec(m.ctx, query)
@@ -362,12 +364,12 @@ func (m *PostgresDBManager) IsFileAlreadyProcessed(checksum string) (bool, error
 func (m *PostgresDBManager) CopyTradesIntoStagingTable(tx pgx.Tx, trades []*models.Trade, stagingTableName string) error {
 	// The column order here must match the order in the `trade_records` table.
 	columnNames := []string{
-		"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id",
+		"checksum", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id",
 	}
 
 	copySource := pgx.CopyFromSlice(len(trades), func(i int) ([]interface{}, error) {
 		trade := trades[i]
-		return []interface{}{trade.Hash, trade.ReferenceDate, trade.TransactionDate, trade.Ticker, trade.Identifier, trade.Price, trade.Quantity, trade.ClosingTime, trade.FileID},
+		return []interface{}{trade.CheckSum, trade.ReferenceDate, trade.TransactionDate, trade.Ticker, trade.Identifier, trade.Price, trade.Quantity, trade.ClosingTime, trade.FileID},
 			nil
 	})
 
@@ -395,8 +397,8 @@ func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, st
 	}
 
 	insertQuery := fmt.Sprintf(`
-	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
-	SELECT hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
+	INSERT INTO trade_records (checksum, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
+	SELECT checksum, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
 	FROM %s;
 	`, pgx.Identifier{stagingTableName}.Sanitize())
 
@@ -417,7 +419,7 @@ func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, st
 }
 
 // InsertDiffFromStagingTable inserts the difference between staging table data and trade_records
-// using a CTE to identify records in the staging table that are not in trade_records by hash value.
+// using a CTE to identify records in the staging table that are not in trade_records by checksum value.
 func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, stagingTableName string) error {
 	tx, err := m.dbpool.Begin(m.ctx)
 	if err != nil {
@@ -432,16 +434,16 @@ func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, s
 	}
 	insertDiffQuery := fmt.Sprintf(`
 	WITH staging_diff AS (
-		SELECT s.hash, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
+		SELECT s.checksum, s.reference_date, s.transaction_date, s.ticker, s.identifier, s.price, s.quantity, s.closing_time, s.file_id
 		FROM %s s
 		WHERE NOT EXISTS (
 			SELECT 1
 			FROM trade_records t
-			WHERE t.hash = s.hash AND t.reference_date = s.reference_date
+			WHERE t.checksum = s.checksum AND t.reference_date = s.reference_date
 		)
 	)
-	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
-	SELECT hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
+	INSERT INTO trade_records (checksum, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
+	SELECT checksum, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
 	FROM staging_diff;
 	`, pgx.Identifier{stagingTableName}.Sanitize())
 

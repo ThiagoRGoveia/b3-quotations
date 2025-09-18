@@ -1,13 +1,12 @@
 package checksum
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"strings"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 func GetFileChecksum(filePath string) (string, error) {
@@ -17,7 +16,7 @@ func GetFileChecksum(filePath string) (string, error) {
 	}
 	defer file.Close()
 
-	hasher := xxhash.New()
+	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
 		return "", fmt.Errorf("failed to copy file content to hasher for file %s: %w", filePath, err)
 	}
@@ -25,10 +24,10 @@ func GetFileChecksum(filePath string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func CalculateHash(record []string) string {
+func CalculateCheckSum(record []string) string {
 	lineContent := strings.Join(record, ";")
 
-	digest := xxhash.New()
+	digest := sha256.New()
 	digest.Write([]byte(lineContent))
 
 	return hex.EncodeToString(digest.Sum(nil))

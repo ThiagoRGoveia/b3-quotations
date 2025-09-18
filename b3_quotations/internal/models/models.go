@@ -16,7 +16,7 @@ type Trade struct {
 	ClosingTime     string    `json:"closing_time,omitempty"`
 	Identifier      string    `json:"identifier,omitempty"`
 	FileID          int       `json:"file_id,omitempty"`
-	Hash            string    `json:"hash,omitempty"`
+	CheckSum        string    `json:"checksum,omitempty"`
 }
 
 func (t *Trade) IsValid() bool {

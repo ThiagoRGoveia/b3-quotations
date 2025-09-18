@@ -35,19 +35,23 @@ func (h *IngestionService) Execute(filesPath string) error {
 		return err
 	}
 
-	// Drop indexes before starting for efficiency
+	// Step 0.1: Drop indexes before starting for efficiency
 	h.dbManager.DropTradeRecordIndexes()
-	// Make sure indexes are created after the process
+	// Step 0.2: Make sure indexes are created after the process
 	defer h.dbManager.CreateTradeRecordIndexes()
 
 	fileInfo, channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, cleanup := setupReturn.GetValues()
 	defer cleanup()
 
+	// Step 0.3: Setup the async worker channels and wait groups VERY IMPORTANT: can cause panic if not done
+	h.asyncWorker.WithChannels(channels).WithWaitGroups(waitGroups)
+
 	// Step 1: Preprocess files and send jobs to the parser workers.
+	// - Gets reference dates from files
+	// - Calculates check sum for files and checks if they are already processed
+	// - Saves file record to db
 	// This is done in a goroutine to allow the main flow to continue with worker setup.
 	go h.fileProcessor.PreprocessAndDispatchJobs(fileInfo, *fileMap, channels.Jobs)
-
-	h.asyncWorker.WithChannels(channels).WithWaitGroups(waitGroups)
 
 	// Step 2: Setup the error worker, this worker will handle async errors from the extraction process
 	errorWorkerRunner, errorWorkerWaitGroup, err := h.asyncWorker.SetupErrorWorker()
@@ -57,8 +61,9 @@ func (h *IngestionService) Execute(filesPath string) error {
 	// Step 2.1: Start error worker
 	errorWorkerRunner.Run(fileErrorsMap)
 
-	// Step 3: Setup parser workers, these workers will handle the file parsing to read jobs from
-	// jobs channel
+	// Step 3: Setup parser workers
+	// - Extract data from CSV
+	// - Send trade data to channel, there is one channel per date
 	parserWorkersRunner, parserWorkerWaitGroup, err := h.asyncWorker.SetupParserWorkers(h.config.NumParserWorkers)
 	if err != nil {
 		return err
@@ -68,18 +73,22 @@ func (h *IngestionService) Execute(filesPath string) error {
 	parserWorkersRunner.Run()
 
 	// Step 4: Configure DB workers. This function will return a factory function to start the DB workers goroutines.
+	// - DB workers will handle the idempotency checks
+	// - DB workers will handle the partition checks
+	// - Each trade channel has e configurable number of db workers reading from it
 	dbWorkersRunner, dbWorkerWaitGroup, err := h.asyncWorker.SetupDBWorkers(h.config.NumDBWorkersPerReferenceDate)
 
 	if err != nil {
 		return err
 	}
 
-	// Step 5: Start DB workers. And pass handler that will handle cases where the partition is empty or not.
+	// Step 5: Start DB workers. Here we pass a handler treating the case for idempotency for better readability
 	err = dbWorkersRunner.Run(func(trades *[]*models.Trade, stagingTableName string) error {
 		if isPartitionFirstWrite((*trades)[0].ReferenceDate, createdPartitions) {
-			//empty partition can benefit for insert without idempotency checks
+			//empty partition can benefit from insert without idempotency checks which are faster
 			return h.dbManager.InsertAllStagingTableData(*trades, stagingTableName)
 		} else {
+			// partitions already exists, means there might be data on it, gotta check for duplicates
 			return h.dbManager.InsertDiffFromStagingTable(*trades, stagingTableName)
 		}
 	})
@@ -108,7 +117,7 @@ func (h *IngestionService) Execute(filesPath string) error {
 	// Step 6.4: Close the errors channel after all workers that can produce errors are done.
 	close(channels.Errors)
 
-	// Step 7: Update file status
+	// Step 7: Update each file record with status of operation and errors with results from o
 	h.fileProcessor.UpdateFileStatus(fileErrorsMap, fileMap)
 
 	log.Println("Extraction process finished.")
@@ -176,7 +185,7 @@ func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channel
 		dates = append(dates, date)
 	}
 
-	// Create all needed partitions in a single transaction
+	// Create all needed partitions based in the unique dates processed
 	createdPartitions, err := h.dbManager.CreatePartitionsForDates(dates)
 	if err != nil {
 		log.Fatalf("Failed to create partitions: %v", err)
@@ -187,7 +196,7 @@ func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channel
 	totalDBWorkers := len(uniqueDates) * h.config.NumDBWorkersPerReferenceDate
 	log.Printf("Creating %d staging tables for %d dates with %d workers per date", totalDBWorkers, len(uniqueDates), h.config.NumDBWorkersPerReferenceDate)
 
-	// Create staging tables for each DB worker in a single transaction
+	// Create staging tables for each DB worker to work in isolation
 	stagingTableNames, err := h.dbManager.CreateWorkerStagingTables(totalDBWorkers)
 	if err != nil {
 		log.Fatalf("Failed to create staging tables: %v", err)

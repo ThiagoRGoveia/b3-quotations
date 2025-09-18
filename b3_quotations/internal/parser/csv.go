@@ -117,7 +117,8 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 			continue // Skip corrupted records
 		}
 
-		lineHash := checksum.CalculateHash(record)
+		// we create a line checksum here to be used later for idempotency checks row by row
+		lineCheckSum := checksum.CalculateCheckSum(record)
 
 		trade, err := parseRecord(record, fileID)
 		if err != nil {
@@ -125,7 +126,7 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 			continue // Skip records that can't be parsed
 		}
 
-		trade.Hash = lineHash
+		trade.CheckSum = lineCheckSum
 
 		resultsChan, exists := dateChannels[trade.ReferenceDate.Truncate(24*time.Hour)]
 		if !exists {
