@@ -1,0 +1,8 @@
+package database
+
+const (
+	FILE_STATUS_DONE             = "DONE"
+	FILE_STATUS_PROCESSING       = "PROCESSING"
+	FILE_STATUS_DONE_WITH_ERRORS = "DONE_WITH_ERRORS"
+	FILE_STATUS_FATAL            = "FATAL"
+)
