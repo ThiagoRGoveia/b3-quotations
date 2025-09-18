@@ -1,6 +1,5 @@
-data_ingestion/files/*
-b3_quotations/files/*
+files/*
+samples/*
 .env
 .vscode/*
 TODO.md
-samples/*
