@@ -193,269 +193,246 @@ func BuildTestSetup() (string, *MockDBManager, *MockWorker, *MockProcessor, *Moc
 	return path, dbManager, worker, processor, setup, setupReturn, cfg, time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)
 }
 
-// TestIngestionService_Execute_HappyPath tests the successful execution of the ingestion service.
-func TestIngestionService_Execute_HappyPath(t *testing.T) {
-	// Expect: successful execution of the ingestion service with all mocks being called as expected.
+func TestIngestionService_Execute(t *testing.T) {
+	t.Run("Expect: Execute to run successfully", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		numberOfUniqueDates := 1
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
+		setup.On("build").Return(setupReturn, nil).Once()
+		dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
+		dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
+		totalDBWorkers := numberOfUniqueDates * cfg.NumDBWorkersPerReferenceDate
+		dbManager.On("CreateWorkerStagingTables", totalDBWorkers).Return([]string{"staging_table_1", "staging_table_2", "staging_table_3"}, nil).Once()
+		dbManager.On("DropWorkerStagingTable", "staging_table_1").Return(nil).Once()
+		dbManager.On("DropWorkerStagingTable", "staging_table_2").Return(nil).Once()
+		dbManager.On("DropWorkerStagingTable", "staging_table_3").Return(nil).Once()
+		worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
+		worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
+		dispatcherRunner := Runner[func()]{Run: func() {}}
+		worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(dispatcherRunner, &sync.WaitGroup{}, nil).Once()
+		processor.On("UpdateFileStatus", setupReturn.FileErrorsMap, setupReturn.FileMap).Return(nil).Once()
 
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	numberOfUniqueDates := 1
+		errorRunner := Runner[func(*models.FileErrorMap)]{Run: func(fem *models.FileErrorMap) {}}
+		worker.On("SetupErrorWorker").Return(errorRunner, &sync.WaitGroup{}, nil).Once()
 
-	setup.On("build").Return(setupReturn, nil).Once()
-	dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
-	dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
-	totalDBWorkers := numberOfUniqueDates * cfg.NumDBWorkersPerReferenceDate
-	dbManager.On("CreateWorkerStagingTables", totalDBWorkers).Return([]string{"staging_table_1", "staging_table_2", "staging_table_3"}, nil).Once()
-	dbManager.On("DropWorkerStagingTable", "staging_table_1").Return(nil).Once()
-	dbManager.On("DropWorkerStagingTable", "staging_table_2").Return(nil).Once()
-	dbManager.On("DropWorkerStagingTable", "staging_table_3").Return(nil).Once()
-	worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
-	worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
-	dispatcherRunner := Runner[func()]{Run: func() {}}
-	worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(dispatcherRunner, &sync.WaitGroup{}, nil).Once()
-	processor.On("UpdateFileStatus", setupReturn.FileErrorsMap, setupReturn.FileMap).Return(nil).Once()
+		parserRunner := Runner[func()]{Run: func() {}}
+		worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(parserRunner, &sync.WaitGroup{}, nil).Once()
 
-	errorRunner := Runner[func(*models.FileErrorMap)]{Run: func(fem *models.FileErrorMap) {}}
-	worker.On("SetupErrorWorker").Return(errorRunner, &sync.WaitGroup{}, nil).Once()
+		dbRunner := Runner[func(func(*[]*models.Trade, string) error) error]{Run: func(handler func(*[]*models.Trade, string) error) error { return nil }}
+		worker.On("SetupDBWorkers", cfg.NumDBWorkersPerReferenceDate).Return(dbRunner, &sync.WaitGroup{}, nil).Once()
 
-	parserRunner := Runner[func()]{Run: func() {}}
-	worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(parserRunner, &sync.WaitGroup{}, nil).Once()
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	dbRunner := Runner[func(func(*[]*models.Trade, string) error) error]{Run: func(handler func(*[]*models.Trade, string) error) error { return nil }}
-	worker.On("SetupDBWorkers", cfg.NumDBWorkersPerReferenceDate).Return(dbRunner, &sync.WaitGroup{}, nil).Once()
+		if err != nil {
+			t.Errorf("Did not expect an error, but got: %v", err)
+		}
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+		dbManager.AssertExpectations(t)
+		worker.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		setup.AssertExpectations(t)
+	})
 
-	if err != nil {
-		t.Errorf("Did not expect an error, but got: %v", err)
-	}
+	t.Run("Expect: Error to be returned when fileProcessor.ScanForFiles() fails", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, _, cfg, _ := BuildTestSetup()
+		setup.On("build").Return(models.SetupReturn{}, errors.New("build error")).Once()
 
-	dbManager.AssertExpectations(t)
-	worker.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	setup.AssertExpectations(t)
-}
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-func TestIngestionService_Execute_SetupBuildError(t *testing.T) {
-	// Expect: an error to be returned when the setupService.build() method fails.
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-	path, dbManager, worker, processor, setup, _, cfg, _ := BuildTestSetup()
+		setup.AssertExpectations(t)
+		dbManager.AssertNotCalled(t, "DropTradeRecordIndexes")
+		processor.AssertNotCalled(t, "ScanForFiles")
+	})
 
-	setup.On("build").Return(models.SetupReturn{}, errors.New("build error")).Once()
+	t.Run("Expect: Error to be returned when ScanForFilesError() fails", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, _ := BuildTestSetup()
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(nil, errors.New("scan error")).Once()
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-	setup.AssertExpectations(t)
-	dbManager.AssertNotCalled(t, "DropTradeRecordIndexes")
-	processor.AssertNotCalled(t, "ScanForFiles")
-}
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertNotCalled(t, "CreatePartitionsForDates")
+	})
 
-func TestIngestionService_Execute_ScanForFilesError(t *testing.T) {
-	// Expect: an error to be returned when fileProcessor.ScanForFiles() fails.
+	t.Run("Expect: Error to be returned when setupDatabase() fails due to a partition creation error", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(nil, errors.New("partition error")).Once()
 
-	path, dbManager, worker, processor, setup, _, cfg, _ := BuildTestSetup()
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	fileMap := make(map[int]string)
-	setupReturn := models.SetupReturn{
-		Channels: &models.ExtractionChannels{
-			Results: make(map[time.Time]chan *models.Trade),
-			Errors:  make(chan models.AppError, 100),
-			Jobs:    make(chan models.FileProcessingJob, 100),
-		},
-		WaitGroups:    &models.ExtractionWaitGroups{ParserWg: &sync.WaitGroup{}, DbWg: &sync.WaitGroup{}, MainWg: &sync.WaitGroup{}},
-		FileMap:       &fileMap,
-		FileErrorsMap: &models.FileErrorMap{Errors: make(map[int][]models.AppError)},
-	}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(nil, errors.New("scan error")).Once()
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertExpectations(t)
+		dbManager.AssertNotCalled(t, "DropTradeRecordIndexes")
+	})
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+	t.Run("Expect: Error to be returned when setupDatabase() fails due to a partition creation error", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
+		dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
+		dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
+		worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
+		worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
+		worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(nil, nil, errors.New("dispatcher error")).Once()
+		dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
 
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertNotCalled(t, "CreatePartitionsForDates")
-}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-func TestIngestionService_Execute_SetupDatabaseError(t *testing.T) {
-	// Expect: an error to be returned when setupDatabase() fails due to a partition creation error.
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertExpectations(t)
+		worker.AssertExpectations(t)
+		worker.AssertNotCalled(t, "SetupErrorWorker")
+	})
 
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(nil, errors.New("partition error")).Once()
+	t.Run("Expect: Error to be returned when setupErrorWorker() fails", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
+		dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
+		dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
+		worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
+		worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
+		worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupErrorWorker").Return(nil, nil, errors.New("error worker error")).Once()
+		dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
 
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertExpectations(t)
-	dbManager.AssertNotCalled(t, "DropTradeRecordIndexes")
-}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-func TestIngestionService_Execute_SetupJobDispatcherWorkerError(t *testing.T) {
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertExpectations(t)
+		worker.AssertExpectations(t)
+		worker.AssertNotCalled(t, "SetupParserWorkers")
+	})
 
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
-	dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
-	dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
-	worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
-	worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
-	worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(nil, nil, errors.New("dispatcher error")).Once()
-	dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
+	t.Run("Expect: Error to be returned when setupParserWorkers() fails", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
+		dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
+		dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
+		worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
+		worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
+		worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupErrorWorker").Return(Runner[func(*models.FileErrorMap)]{Run: func(_ *models.FileErrorMap) {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(nil, nil, errors.New("parser error")).Once()
+		dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
 
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertExpectations(t)
-	worker.AssertExpectations(t)
-	worker.AssertNotCalled(t, "SetupErrorWorker")
-}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-func TestIngestionService_Execute_SetupErrorWorkerError(t *testing.T) {
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertExpectations(t)
+		worker.AssertExpectations(t)
+		worker.AssertNotCalled(t, "SetupDBWorkers")
+	})
 
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
-	dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
-	dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
-	worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
-	worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
-	worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupErrorWorker").Return(nil, nil, errors.New("error worker error")).Once()
-	dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
+	t.Run("Expect: Error to be returned when setupDBWorkers() fails", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
+		dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
+		dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
+		worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
+		worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
+		worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupErrorWorker").Return(Runner[func(*models.FileErrorMap)]{Run: func(_ *models.FileErrorMap) {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupDBWorkers", cfg.NumDBWorkersPerReferenceDate).Return(nil, nil, errors.New("db worker error")).Once()
+		dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
 
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertExpectations(t)
-	worker.AssertExpectations(t)
-	worker.AssertNotCalled(t, "SetupParserWorkers")
-}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-func TestIngestionService_Execute_SetupParserWorkersError(t *testing.T) {
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertExpectations(t)
+		worker.AssertExpectations(t)
+	})
 
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
-	dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
-	dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
-	worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
-	worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
-	worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupErrorWorker").Return(Runner[func(*models.FileErrorMap)]{Run: func(_ *models.FileErrorMap) {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(nil, nil, errors.New("parser error")).Once()
-	dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
+	t.Run("Expect: Error to be returned when DBWorkersRunner() fails", func(t *testing.T) {
+		path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
+		scanResult := []models.FileInfo{{ReferenceDate: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC)}}
 
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
+		setup.On("build").Return(setupReturn, nil).Once()
+		processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
+		dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
+		dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
+		dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
+		worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
+		worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
+		worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupErrorWorker").Return(Runner[func(*models.FileErrorMap)]{Run: func(_ *models.FileErrorMap) {}}, &sync.WaitGroup{}, nil).Once()
+		worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
+		dbRunner := Runner[func(func(*[]*models.Trade, string) error) error]{Run: func(handler func(*[]*models.Trade, string) error) error { return errors.New("db runner error") }}
+		worker.On("SetupDBWorkers", cfg.NumDBWorkersPerReferenceDate).Return(dbRunner, &sync.WaitGroup{}, nil).Once()
+		dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
 
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
+		service := NewIngestionService(dbManager, setup, worker, processor, cfg)
+		err := service.Execute(path)
 
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertExpectations(t)
-	worker.AssertExpectations(t)
-	worker.AssertNotCalled(t, "SetupDBWorkers")
-}
+		if err == nil {
+			t.Errorf("Expected an error, but got nil")
+		}
 
-func TestIngestionService_Execute_SetupDBWorkersError(t *testing.T) {
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
-
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
-	dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
-	dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
-	worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
-	worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
-	worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupErrorWorker").Return(Runner[func(*models.FileErrorMap)]{Run: func(_ *models.FileErrorMap) {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupDBWorkers", cfg.NumDBWorkersPerReferenceDate).Return(nil, nil, errors.New("db worker error")).Once()
-	dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
-
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
-
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
-
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertExpectations(t)
-	worker.AssertExpectations(t)
-}
-
-func TestIngestionService_Execute_DBWorkersRunnerError(t *testing.T) {
-	path, dbManager, worker, processor, setup, setupReturn, cfg, date := BuildTestSetup()
-	scanResult := []models.FileInfo{{ReferenceDate: date}}
-
-	setup.On("build").Return(setupReturn, nil).Once()
-	processor.On("ScanForFiles", path).Return(scanResult, nil).Once()
-	dbManager.On("CreatePartitionsForDates", []time.Time{date}).Return(&models.FirstWritePartition{}, nil).Once()
-	dbManager.On("CreateWorkerStagingTables", cfg.NumDBWorkersPerReferenceDate).Return([]string{}, nil).Once()
-	dbManager.On("DropTradeRecordIndexes").Return(nil).Once()
-	worker.On("WithChannels", setupReturn.Channels).Return(worker).Once()
-	worker.On("WithWaitGroups", setupReturn.WaitGroups).Return(worker).Once()
-	worker.On("SetupJobDispatcherWorker", scanResult, *setupReturn.FileMap).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupErrorWorker").Return(Runner[func(*models.FileErrorMap)]{Run: func(_ *models.FileErrorMap) {}}, &sync.WaitGroup{}, nil).Once()
-	worker.On("SetupParserWorkers", cfg.NumParserWorkers).Return(Runner[func()]{Run: func() {}}, &sync.WaitGroup{}, nil).Once()
-	dbRunner := Runner[func(func(*[]*models.Trade, string) error) error]{Run: func(handler func(*[]*models.Trade, string) error) error { return errors.New("db runner error") }}
-	worker.On("SetupDBWorkers", cfg.NumDBWorkersPerReferenceDate).Return(dbRunner, &sync.WaitGroup{}, nil).Once()
-	dbManager.On("CreateTradeRecordIndexes").Return(nil).Once()
-
-	service := NewIngestionService(dbManager, setup, worker, processor, cfg)
-	err := service.Execute(path)
-
-	if err == nil {
-		t.Errorf("Expected an error, but got nil")
-	}
-
-	setup.AssertExpectations(t)
-	processor.AssertExpectations(t)
-	dbManager.AssertExpectations(t)
-	worker.AssertExpectations(t)
+		setup.AssertExpectations(t)
+		processor.AssertExpectations(t)
+		dbManager.AssertExpectations(t)
+		worker.AssertExpectations(t)
+	})
 }
