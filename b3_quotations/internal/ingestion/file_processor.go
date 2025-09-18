@@ -13,10 +13,30 @@ import (
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/pkg/checksum"
 )
 
-// getReferenceDates scans a directory for files, extracts a reference date from each,
+// Processor defines the interface for file processing operations.
+type Processor interface {
+	ScanForFiles(rootPath string) ([]models.FileInfo, error)
+	PreprocessAndDispatchJobs(fileInfos []models.FileInfo, fileMap map[int]string, jobsChan chan<- models.FileProcessingJob)
+	UpdateFileStatus(fileErrorsMap *models.FileErrorMap, fileMap *models.FileMap) error
+}
+
+// FileProcessor handles the initial stages of file processing, including
+// discovering files, dispatching jobs, and updating file statuses.
+type FileProcessor struct {
+	dbManager database.DBManager
+}
+
+// NewFileProcessor creates a new FileProcessor with the given DBManager.
+func NewFileProcessor(dbManager database.DBManager) *FileProcessor {
+	return &FileProcessor{
+		dbManager: dbManager,
+	}
+}
+
+// ScanForFiles scans a directory for files, extracts a reference date from each,
 // and returns a list of FileInfo structs. This initial scan helps determine
 // which database partitions will be needed before full processing begins.
-func getReferenceDates(rootPath string) ([]models.FileInfo, error) {
+func (fp *FileProcessor) ScanForFiles(rootPath string) ([]models.FileInfo, error) {
 	var fileInfos []models.FileInfo
 	log.Printf("Scanning for files in: %s", rootPath)
 
@@ -45,13 +65,12 @@ func getReferenceDates(rootPath string) ([]models.FileInfo, error) {
 	return fileInfos, nil
 }
 
-// preprocessAndDispatchJobs iterates through a list of discovered files, performs preliminary
+// PreprocessAndDispatchJobs iterates through a list of discovered files, performs preliminary
 // checks, creates a database record for tracking, and sends a job to the jobs channel
 // for the parser workers. It handles checksum verification to ensure idempotency.
 // This function should be run in a goroutine.
-func preprocessAndDispatchJobs(
+func (fp *FileProcessor) PreprocessAndDispatchJobs(
 	fileInfos []models.FileInfo,
-	dbManager database.DBManager,
 	fileMap map[int]string,
 	jobsChan chan<- models.FileProcessingJob,
 ) {
@@ -68,7 +87,7 @@ func preprocessAndDispatchJobs(
 		}
 
 		// Check if a file with this checksum has already been successfully processed
-		isProcessed, err := dbManager.IsFileAlreadyProcessed(checksum)
+		isProcessed, err := fp.dbManager.IsFileAlreadyProcessed(checksum)
 		if err != nil {
 			log.Printf("ERROR: Failed to check if file %s is already processed: %v. Skipping file.", fileInfo.Path, err)
 			continue
@@ -80,7 +99,7 @@ func preprocessAndDispatchJobs(
 
 		// Create a record in the database to track this file's processing.
 		// The status is initially set to "PROCESSING".
-		fileID, err := dbManager.InsertFileRecord(
+		fileID, err := fp.dbManager.InsertFileRecord(
 			fileInfo.Path,
 			time.Now(),
 			database.FILE_STATUS_PROCESSING,
@@ -101,7 +120,7 @@ func preprocessAndDispatchJobs(
 	}
 }
 
-func UpdateFileStatus(dbManager database.DBManager, fileErrorsMap *models.FileErrorMap, fileMap *models.FileMap) error {
+func (fp *FileProcessor) UpdateFileStatus(fileErrorsMap *models.FileErrorMap, fileMap *models.FileMap) error {
 	for fileID := range *fileMap {
 		appErrors := fileErrorsMap.Errors[fileID]
 		status := database.FILE_STATUS_DONE
@@ -109,9 +128,14 @@ func UpdateFileStatus(dbManager database.DBManager, fileErrorsMap *models.FileEr
 			status = database.FILE_STATUS_DONE_WITH_ERRORS
 		}
 
-		if err := dbManager.UpdateFileStatus(fileID, status, appErrors); err != nil {
+		if err := fp.dbManager.UpdateFileStatus(fileID, status, appErrors); err != nil {
 			log.Printf("Failed to update status for fileID %d: %v\n", fileID, err)
 		}
 	}
 	return nil
+}
+
+func isPartitionFirstWrite(partitionName time.Time, partitionMap *models.FirstWritePartition) bool {
+	wasCreatedThisRun := (*partitionMap)[partitionName]
+	return wasCreatedThisRun
 }

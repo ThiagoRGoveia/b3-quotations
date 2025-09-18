@@ -19,6 +19,15 @@ type AsyncWorkerConfig struct {
 	DBBatchSize                  int
 }
 
+// Worker defines the interface for asynchronous processing tasks.
+type Worker interface {
+	WithChannels(channels *models.ExtractionChannels) Worker
+	WithWaitGroups(waitGroups *models.ExtractionWaitGroups) Worker
+	SetupErrorWorker() (Runner[func(*models.FileErrorMap)], *sync.WaitGroup, error)
+	SetupParserWorkers(numberOfWorkers int) (Runner[func()], *sync.WaitGroup, error)
+	SetupDBWorkers(numDBWorkersPerReferenceDate int) (Runner[func(func(*[]*models.Trade, string) error) error], *sync.WaitGroup, error)
+}
+
 type AsyncWorker struct {
 	config     AsyncWorkerConfig
 	dbManager  database.DBManager
@@ -33,12 +42,12 @@ func NewAsyncWorker(dbManager database.DBManager, cfg AsyncWorkerConfig) *AsyncW
 	}
 }
 
-func (w *AsyncWorker) WithChannels(channels *models.ExtractionChannels) *AsyncWorker {
+func (w *AsyncWorker) WithChannels(channels *models.ExtractionChannels) Worker {
 	w.channels = channels
 	return w
 }
 
-func (w *AsyncWorker) WithWaitGroups(waitGroups *models.ExtractionWaitGroups) *AsyncWorker {
+func (w *AsyncWorker) WithWaitGroups(waitGroups *models.ExtractionWaitGroups) Worker {
 	w.waitGroups = waitGroups
 	return w
 }

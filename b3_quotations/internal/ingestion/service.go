@@ -11,24 +11,18 @@ import (
 )
 
 type IngestionService struct {
-	dbManager   database.DBManager
-	asyncWorker AsyncWorker
-	config      config.Config
+	dbManager     database.DBManager
+	asyncWorker   Worker
+	fileProcessor Processor
+	config        config.Config
 }
 
-func NewIngestionService(dbManager database.DBManager, numParserWorkers int, numDBWorkersPerDate int, dbBatchSize int, resultsChannelSize int) *IngestionService {
+func NewIngestionService(dbManager database.DBManager, worker Worker, processor Processor, cfg config.Config) *IngestionService {
 	return &IngestionService{
-		dbManager: dbManager,
-		asyncWorker: *NewAsyncWorker(dbManager, AsyncWorkerConfig{
-			NumDBWorkersPerReferenceDate: numDBWorkersPerDate,
-			DBBatchSize:                  dbBatchSize,
-		}),
-		config: config.Config{
-			NumParserWorkers:             numParserWorkers,
-			NumDBWorkersPerReferenceDate: numDBWorkersPerDate,
-			DBBatchSize:                  dbBatchSize,
-			ResultsChannelSize:           resultsChannelSize,
-		},
+		dbManager:     dbManager,
+		asyncWorker:   worker,
+		fileProcessor: processor,
+		config:        cfg,
 	}
 }
 
@@ -50,11 +44,8 @@ func (h *IngestionService) Execute(filesPath string) error {
 	defer cleanup()
 
 	// Step 1: Preprocess files and send jobs to the parser workers.
-	// This needs to be in a goroutine so that the main thread can close the jobs channel.
-	go func() {
-		preprocessAndDispatchJobs(fileInfo, h.dbManager, *fileMap, channels.Jobs)
-		close(channels.Jobs) // Close the jobs channel after all jobs have been sent.
-	}()
+	// This is done in a goroutine to allow the main flow to continue with worker setup.
+	go h.fileProcessor.PreprocessAndDispatchJobs(fileInfo, *fileMap, channels.Jobs)
 
 	h.asyncWorker.WithChannels(channels).WithWaitGroups(waitGroups)
 
@@ -101,21 +92,24 @@ func (h *IngestionService) Execute(filesPath string) error {
 	log.Println("Waiting for parser workers to finish...")
 	parserWorkerWaitGroup.Wait()
 
-	// After parsers are done, close all date-specific results channels to signal DB workers to finish.
+	// Step 6.1: After parsers are done, close all date-specific results channels to signal DB workers to finish.
 	for _, resultsChan := range channels.Results {
 		close(resultsChan)
 	}
 
+	// Step 6.2: Wait for DB workers to finish
 	log.Println("Waiting for DB workers to finish...")
 	dbWorkerWaitGroup.Wait()
 
+	// Step 6.3: Wait for file error worker to finish
 	log.Println("Waiting for file error worker to finish...")
 	errorWorkerWaitGroup.Wait()
 
-	// Close the errors channel after all workers that can produce errors are done.
+	// Step 6.4: Close the errors channel after all workers that can produce errors are done.
 	close(channels.Errors)
 
-	UpdateFileStatus(h.dbManager, fileErrorsMap, fileMap)
+	// Step 7: Update file status
+	h.fileProcessor.UpdateFileStatus(fileErrorsMap, fileMap)
 
 	log.Println("Extraction process finished.")
 	return nil
@@ -137,7 +131,7 @@ func (h *IngestionService) setup(filesPath string) (models.SetupReturn, error) {
 	fileErrorsMap := models.FileErrorMap{Errors: make(map[int][]models.AppError)}
 	// Step 0.2: Synchronously get all file paths and their reference dates.
 	log.Println("Scanning files to determine required partitions...")
-	referenceDates, err := getReferenceDates(filesPath)
+	referenceDates, err := h.fileProcessor.ScanForFiles(filesPath)
 	if err != nil {
 		log.Fatalf("Failed to scan files: %v", err)
 		return models.SetupReturn{}, err
@@ -207,9 +201,4 @@ func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channel
 			h.dbManager.DropWorkerStagingTable(tableName)
 		}
 	}, createdPartitions, nil
-}
-
-func isPartitionFirstWrite(partitionName time.Time, partitionMap *models.FirstWritePartition) bool {
-	wasCreatedThisRun := (*partitionMap)[partitionName]
-	return wasCreatedThisRun
 }
