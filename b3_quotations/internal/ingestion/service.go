@@ -1,7 +1,6 @@
 package ingestion
 
 import (
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -21,7 +20,6 @@ func NewIngestionService(dbManager database.DBManager, numParserWorkers int, num
 	return &IngestionService{
 		dbManager: dbManager,
 		asyncWorker: *NewAsyncWorker(dbManager, AsyncWorkerConfig{
-			NumParserWorkers:             numParserWorkers,
 			NumDBWorkersPerReferenceDate: numDBWorkersPerDate,
 			DBBatchSize:                  dbBatchSize,
 		}),
@@ -49,24 +47,44 @@ func (h *IngestionService) Execute(filesPath string) error {
 	defer h.dbManager.CreateTradeRecordIndexes()
 
 	fileInfo, channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, cleanup := setupReturn.GetValues()
-
 	defer cleanup()
 
-	// Step 1: Start the error worker, this worker will handle async errors from the extraction process
-	waitGroups.ErrorWg.Add(1)
-	go h.asyncWorker.ErrorWorker(channels, fileErrorsMap, waitGroups)
+	// Step 1: Preprocess files and send jobs to the parser workers.
+	// This needs to be in a goroutine so that the main thread can close the jobs channel.
+	go func() {
+		preprocessAndDispatchJobs(fileInfo, h.dbManager, *fileMap, channels.Jobs)
+		close(channels.Jobs) // Close the jobs channel after all jobs have been sent.
+	}()
 
-	// Step 2: Start parser workers, these workers will handle the file parsing
-	for w := 1; w <= h.config.NumParserWorkers; w++ {
-		waitGroups.ParserWg.Add(1)
-		go h.asyncWorker.ParserWorker(channels, waitGroups)
+	h.asyncWorker.WithChannels(channels).WithWaitGroups(waitGroups)
+
+	// Step 2: Setup the error worker, this worker will handle async errors from the extraction process
+	errorWorkerRunner, errorWorkerWaitGroup, err := h.asyncWorker.SetupErrorWorker()
+	if err != nil {
+		return err
+	}
+	// Step 2.1: Start error worker
+	errorWorkerRunner.Run(fileErrorsMap)
+
+	// Step 3: Setup parser workers, these workers will handle the file parsing to read jobs from
+	// jobs channel
+	parserWorkersRunner, parserWorkerWaitGroup, err := h.asyncWorker.SetupParserWorkers(h.config.NumParserWorkers)
+	if err != nil {
+		return err
 	}
 
-	// Step 3: Configure DB workers. This function will return a factory function to start the DB workers goroutines.
-	dbWorkers := h.configDbWorkers(channels, waitGroups)
+	// Step 3.1: Start parser workers
+	parserWorkersRunner.Run()
 
-	// Step 4: Start DB workers. And pass handler that will handle cases where the partition is empty or not.
-	err = dbWorkers(func(trades *[]*models.Trade, stagingTableName string) error {
+	// Step 4: Configure DB workers. This function will return a factory function to start the DB workers goroutines.
+	dbWorkersRunner, dbWorkerWaitGroup, err := h.asyncWorker.SetupDBWorkers(h.config.NumDBWorkersPerReferenceDate)
+
+	if err != nil {
+		return err
+	}
+
+	// Step 5: Start DB workers. And pass handler that will handle cases where the partition is empty or not.
+	err = dbWorkersRunner.Run(func(trades *[]*models.Trade, stagingTableName string) error {
 		if isPartitionFirstWrite((*trades)[0].ReferenceDate, createdPartitions) {
 			//empty partition can benefit for insert without idempotency checks
 			return h.dbManager.InsertAllStagingTableData(*trades, stagingTableName)
@@ -74,20 +92,14 @@ func (h *IngestionService) Execute(filesPath string) error {
 			return h.dbManager.InsertDiffFromStagingTable(*trades, stagingTableName)
 		}
 	})
+
 	if err != nil {
 		return err
 	}
 
-	// Step 5: Preprocess files and send jobs to the parser workers.
-	// This needs to be in a goroutine so that the main thread can close the jobs channel.
-	go func() {
-		preprocessAndDispatchJobs(fileInfo, h.dbManager, *fileMap, channels.Jobs)
-		close(channels.Jobs) // Close the jobs channel after all jobs have been sent.
-	}()
-
 	// Step 6: Wait for all processing to complete.
 	log.Println("Waiting for parser workers to finish...")
-	waitGroups.ParserWg.Wait()
+	parserWorkerWaitGroup.Wait()
 
 	// After parsers are done, close all date-specific results channels to signal DB workers to finish.
 	for _, resultsChan := range channels.Results {
@@ -95,18 +107,15 @@ func (h *IngestionService) Execute(filesPath string) error {
 	}
 
 	log.Println("Waiting for DB workers to finish...")
-	waitGroups.DbWg.Wait()
+	dbWorkerWaitGroup.Wait()
+
+	log.Println("Waiting for file error worker to finish...")
+	errorWorkerWaitGroup.Wait()
 
 	// Close the errors channel after all workers that can produce errors are done.
 	close(channels.Errors)
 
-	// TODO: This needs cleanup, it does not need to be a separate worker, can be sync, also
-	// needs error handling, and the updates can be batched.
-	waitGroups.ErrorWg.Add(1)
-	go h.asyncWorker.FileStatusWorker(fileErrorsMap, waitGroups, fileMap)
-
-	// Wait for the error and status workers to finish
-	waitGroups.ErrorWg.Wait()
+	UpdateFileStatus(h.dbManager, fileErrorsMap, fileMap)
 
 	log.Println("Extraction process finished.")
 	return nil
@@ -117,7 +126,6 @@ func (h *IngestionService) setup(filesPath string) (models.SetupReturn, error) {
 	jobs := make(chan models.FileProcessingJob, 100)
 	errors := make(chan models.AppError, 100)
 
-	// Initialize the channels struct with empty map
 	channels := models.ExtractionChannels{
 		Results: make(map[time.Time]chan *models.Trade),
 		Errors:  errors,
@@ -142,10 +150,6 @@ func (h *IngestionService) setup(filesPath string) (models.SetupReturn, error) {
 		return models.SetupReturn{}, err
 	}
 
-	log.Println("Database setup complete. All necessary tables and partitions are ready.")
-
-	// Step 0.5: Start all worker pools.
-	log.Println("Starting worker pools...")
 	return models.SetupReturn{
 		FileInfo:          referenceDates,
 		Channels:          &channels,
@@ -157,35 +161,12 @@ func (h *IngestionService) setup(filesPath string) (models.SetupReturn, error) {
 	}, nil
 }
 
-func (h *IngestionService) configDbWorkers(channels *models.ExtractionChannels, waitGroups *models.ExtractionWaitGroups) func(func(*[]*models.Trade, string) error) error {
-	return func(dbHandler func(*[]*models.Trade, string) error) error {
-		workerCounter := 1
-		for date, resultsChan := range channels.Results {
-			log.Printf("Starting %d DB workers for date %s", h.config.NumDBWorkersPerReferenceDate, date.Format("2006-01-02"))
-			for w := 1; w <= h.config.NumDBWorkersPerReferenceDate; w++ {
-				workerId := workerCounter
-				stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
-				waitGroups.DbWg.Add(1)
-				go h.asyncWorker.DbWorker(workerId, stagingTableName, resultsChan, channels.Errors, waitGroups, dbHandler)
-				workerCounter++
-			}
-		}
-		return nil
-	}
-}
-
-// FileStatusWorker updates the final status of each processed file based on whether errors occurred.
 func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channels *models.ExtractionChannels) (func(), *models.FirstWritePartition, error) {
-	// Create database tables // TEMP move this into docker setup
-	h.dbManager.CreateFileRecordsTable()
-	h.dbManager.CreateTradeRecordsTable()
-	h.dbManager.CreateTradeRecordIndexes()
-
-	// Build a set of unique dates from the file information.
-	uniqueDates := make(map[time.Time]struct{})
+	// Build a set of unique dates from the file information. This will guide the partition management.
+	uniqueDates := make(map[time.Time]bool)
 	for _, fileInfo := range fileInfoList {
 		normalizedDate := fileInfo.ReferenceDate.Truncate(24 * time.Hour)
-		uniqueDates[normalizedDate] = struct{}{}
+		uniqueDates[normalizedDate] = true
 
 		// Create a results channel for this date if it doesn't exist yet
 		if _, exists := channels.Results[normalizedDate]; !exists {
@@ -208,7 +189,7 @@ func (h *IngestionService) setupDatabase(fileInfoList []models.FileInfo, channel
 		return nil, createdPartitions, err
 	}
 
-	// Calculate the total number of DB workers (numDates * numDBWorkersPerDate)
+	// Calculate the total number of DB workers (numDates * NumDBWorkersPerReferenceDate)
 	totalDBWorkers := len(uniqueDates) * h.config.NumDBWorkersPerReferenceDate
 	log.Printf("Creating %d staging tables for %d dates with %d workers per date", totalDBWorkers, len(uniqueDates), h.config.NumDBWorkersPerReferenceDate)
 

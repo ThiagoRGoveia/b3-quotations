@@ -100,3 +100,18 @@ func preprocessAndDispatchJobs(
 		jobsChan <- models.FileProcessingJob{FilePath: fileInfo.Path, FileID: fileID}
 	}
 }
+
+func UpdateFileStatus(dbManager database.DBManager, fileErrorsMap *models.FileErrorMap, fileMap *models.FileMap) error {
+	for fileID := range *fileMap {
+		appErrors := fileErrorsMap.Errors[fileID]
+		status := database.FILE_STATUS_DONE
+		if len(appErrors) > 0 {
+			status = database.FILE_STATUS_DONE_WITH_ERRORS
+		}
+
+		if err := dbManager.UpdateFileStatus(fileID, status, appErrors); err != nil {
+			log.Printf("Failed to update status for fileID %d: %v\n", fileID, err)
+		}
+	}
+	return nil
+}

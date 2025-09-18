@@ -1,22 +1,29 @@
 package ingestion
 
 import (
+	"fmt"
 	"log"
+	"sync"
 
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/database"
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/models"
 	"github.com/ThiagoRGoveia/b3-quotations.git/b3_quotations/internal/parser"
 )
 
+type Runner[T any] struct {
+	Run T
+}
+
 type AsyncWorkerConfig struct {
-	NumParserWorkers             int
 	NumDBWorkersPerReferenceDate int
 	DBBatchSize                  int
 }
 
 type AsyncWorker struct {
-	config    AsyncWorkerConfig
-	dbManager database.DBManager
+	config     AsyncWorkerConfig
+	dbManager  database.DBManager
+	channels   *models.ExtractionChannels
+	waitGroups *models.ExtractionWaitGroups
 }
 
 func NewAsyncWorker(dbManager database.DBManager, cfg AsyncWorkerConfig) *AsyncWorker {
@@ -26,16 +33,37 @@ func NewAsyncWorker(dbManager database.DBManager, cfg AsyncWorkerConfig) *AsyncW
 	}
 }
 
-func (w *AsyncWorker) ParserWorker(channels *models.ExtractionChannels, waitGroups *models.ExtractionWaitGroups) {
-	defer waitGroups.ParserWg.Done()
-	for job := range channels.Jobs {
+func (w *AsyncWorker) WithChannels(channels *models.ExtractionChannels) *AsyncWorker {
+	w.channels = channels
+	return w
+}
+
+func (w *AsyncWorker) WithWaitGroups(waitGroups *models.ExtractionWaitGroups) *AsyncWorker {
+	w.waitGroups = waitGroups
+	return w
+}
+
+func (w *AsyncWorker) ParserWorker() {
+	defer w.waitGroups.ParserWg.Done()
+	for job := range w.channels.Jobs {
 		log.Printf("Parser worker started job for file %s (ID: %d)\n", job.FilePath, job.FileID)
-		err := parser.ParseCSV(job.FilePath, job.FileID, channels.Results, channels.Errors)
+		err := parser.ParseCSV(job.FilePath, job.FileID, w.channels.Results, w.channels.Errors)
 		if err != nil {
-			channels.Errors <- models.AppError{FileID: job.FileID, Message: "Failed to open or read file", Err: err}
+			w.channels.Errors <- models.AppError{FileID: job.FileID, Message: "Failed to open or read file", Err: err}
 		}
 		log.Printf("Parser worker finished job for file %s (ID: %d)\n", job.FilePath, job.FileID)
 	}
+}
+
+func (w *AsyncWorker) SetupParserWorkers(numberOfWorkers int) (Runner[func()], *sync.WaitGroup, error) {
+	return Runner[func()]{
+		Run: func() {
+			for i := 1; i <= numberOfWorkers; i++ {
+				w.waitGroups.ParserWg.Add(1)
+				go w.ParserWorker()
+			}
+		},
+	}, w.waitGroups.ParserWg, nil
 }
 
 func (w *AsyncWorker) DbWorker(workerId int, stagingTableName string, resultsChan <-chan *models.Trade, errorsChan chan<- models.AppError, waitGroups *models.ExtractionWaitGroups, dbHandler func(*[]*models.Trade, string) error) {
@@ -82,9 +110,28 @@ func (w *AsyncWorker) DbWorker(workerId int, stagingTableName string, resultsCha
 	log.Printf("DB worker %d finished.", workerId)
 }
 
-func (w *AsyncWorker) ErrorWorker(channels *models.ExtractionChannels, fileErrorsMap *models.FileErrorMap, waitGroups *models.ExtractionWaitGroups) {
-	defer waitGroups.ErrorWg.Done()
-	for appErr := range channels.Errors {
+func (w *AsyncWorker) SetupDBWorkers(numDBWorkersPerReferenceDate int) (Runner[func(func(*[]*models.Trade, string) error) error], *sync.WaitGroup, error) {
+	return Runner[func(func(*[]*models.Trade, string) error) error]{
+		Run: func(dbHandler func(*[]*models.Trade, string) error) error {
+			workerCounter := 1
+			for date, resultsChan := range w.channels.Results {
+				log.Printf("Starting %d DB workers for date %s", numDBWorkersPerReferenceDate, date.Format("2006-01-02"))
+				for i := 1; i <= numDBWorkersPerReferenceDate; i++ {
+					workerId := workerCounter
+					stagingTableName := fmt.Sprintf("trade_records_staging_worker_%d", workerId)
+					w.waitGroups.DbWg.Add(1)
+					go w.DbWorker(workerId, stagingTableName, resultsChan, w.channels.Errors, w.waitGroups, dbHandler)
+					workerCounter++
+				}
+			}
+			return nil
+		},
+	}, w.waitGroups.DbWg, nil
+}
+
+func (w *AsyncWorker) ErrorWorker(fileErrorsMap *models.FileErrorMap) {
+	defer w.waitGroups.ErrorWg.Done()
+	for appErr := range w.channels.Errors {
 		log.Printf("Caught error: %s\n", appErr.Error())
 		// limit the number of errors per file to prevent memory overflow, if more than 100 errors are collected, then file is probably malformed
 		if appErr.FileID != -1 && len(fileErrorsMap.Errors) < 100 {
@@ -98,21 +145,11 @@ func (w *AsyncWorker) ErrorWorker(channels *models.ExtractionChannels, fileError
 	}
 }
 
-func (w *AsyncWorker) FileStatusWorker(fileErrorsMap *models.FileErrorMap, waitGroups *models.ExtractionWaitGroups, fileMap *models.FileMap) {
-	defer waitGroups.ErrorWg.Done()
-
-	fileErrorsMap.Mu.Lock()
-	defer fileErrorsMap.Mu.Unlock()
-
-	for fileID := range *fileMap {
-		appErrors := fileErrorsMap.Errors[fileID]
-		status := database.FILE_STATUS_DONE
-		if len(appErrors) > 0 {
-			status = database.FILE_STATUS_DONE_WITH_ERRORS
-		}
-
-		if err := w.dbManager.UpdateFileStatus(fileID, status, appErrors); err != nil {
-			log.Printf("Failed to update status for fileID %d: %v\n", fileID, err)
-		}
-	}
+func (w *AsyncWorker) SetupErrorWorker() (Runner[func(*models.FileErrorMap)], *sync.WaitGroup, error) {
+	return Runner[func(*models.FileErrorMap)]{
+		Run: func(fileErrorsMap *models.FileErrorMap) {
+			w.waitGroups.ErrorWg.Add(1)
+			go w.ErrorWorker(fileErrorsMap)
+		},
+	}, w.waitGroups.ErrorWg, nil
 }
