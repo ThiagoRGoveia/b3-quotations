@@ -28,10 +28,8 @@ func (h *TickerHandler) GetTickerInfo(w http.ResponseWriter, r *http.Request) {
 	startDateStr := r.URL.Query().Get("data_inicio")
 
 	if startDateStr == "" {
-		// If not provided, default to 7 business days in the past
 		startDate = getPastBusinessDay(7)
 	} else {
-		// If provided, parse it
 		var err error
 		startDate, err = time.Parse("2006-01-02", startDateStr)
 		if err != nil {

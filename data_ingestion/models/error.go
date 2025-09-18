@@ -5,7 +5,6 @@ import (
 	"fmt"
 )
 
-// AppError represents a custom error in the application, including context about the job.
 type AppError struct {
 	FileID  int
 	Message string
@@ -13,7 +12,6 @@ type AppError struct {
 	Trade   *Trade
 }
 
-// Error returns the string representation of the AppError.
 func (e *AppError) Error() string {
 	var tradeDetails string
 	if e.Trade != nil {

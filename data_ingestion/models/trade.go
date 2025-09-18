@@ -2,7 +2,6 @@ package models
 
 import "time"
 
-// Trade represents a single trade from the CSV file
 type Trade struct {
 	TransactionDate time.Time `json:"transaction_date,omitempty"`
 	ReferenceDate   time.Time `json:"reference_date,omitempty"`

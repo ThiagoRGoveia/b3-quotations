@@ -34,9 +34,16 @@ func NewExtractionHandler(dbManager db.DBManager, numParserWorkers int, numDBWor
 func (h *ExtractionHandler) Execute(filesPath string) error {
 	// Step 0: Setup the extraction environment.
 	setupReturn, err := h.setup(filesPath)
+
 	if err != nil {
 		return err
 	}
+
+	// Drop indexes before starting for efficiency
+	h.dbManager.DropTradeRecordIndexes()
+	// Make sure indexes are created after the process
+	defer h.dbManager.CreateTradeRecordIndexes()
+
 	fileInfo, channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, cleanup := setupReturn.getValues()
 
 	defer cleanup()

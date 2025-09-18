@@ -15,7 +15,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-// GetReferenceDateFromFile opens a CSV file, reads the first data row, and returns the reference date.
 func GetReferenceDateFromFile(filePath string) (time.Time, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -31,7 +30,6 @@ func GetReferenceDateFromFile(filePath string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("failed to read header from %s: %w", filePath, err)
 	}
 
-	// Read the first data record
 	record, err := reader.Read()
 	if err != nil {
 		if err == io.EOF {
@@ -40,7 +38,6 @@ func GetReferenceDateFromFile(filePath string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("failed to read first data record from %s: %w", filePath, err)
 	}
 
-	// The reference date is in the first column
 	if len(record) == 0 {
 		return time.Time{}, fmt.Errorf("empty record in file %s", filePath)
 	}
@@ -53,7 +50,6 @@ func GetReferenceDateFromFile(filePath string) (time.Time, error) {
 	return dataReferencia, nil
 }
 
-// parseRecord parses a single CSV record into a Trade struct.
 func parseRecord(record []string, fileID int) (*models.Trade, error) {
 	// DataReferencia;CodigoInstrumento;AcaoAtualizacao;PrecoNegocio;QuantidadeNegociada;HoraFechamento;CodigoIdentificadorNegocio;TipoSessaoPregao;DataNegocio;CodigoParticipanteComprador;CodigoParticipanteVendedor
 	precoNegocioStr := strings.Replace(record[3], ",", ".", 1)
@@ -95,7 +91,6 @@ func parseRecord(record []string, fileID int) (*models.Trade, error) {
 	}, nil
 }
 
-// ParseCSV reads a CSV file from the given path and streams parsed records into the appropriate channel based on reference date.
 func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *models.Trade, errors chan<- models.AppError) error {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -123,7 +118,6 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 			continue // Skip corrupted records
 		}
 
-		// Calculate hash of the raw CSV line
 		lineHash := calculateHash(record)
 
 		trade, err := parseRecord(record, fileID)
@@ -132,10 +126,8 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 			continue // Skip records that can't be parsed
 		}
 
-		// Set the hash in the trade record
 		trade.Hash = lineHash
 
-		// Find the correct channel for this trade's reference date
 		resultsChan, exists := dateChannels[trade.ReferenceDate.Truncate(24*time.Hour)]
 		if !exists {
 			errors <- models.AppError{FileID: fileID, Message: "No channel found for reference date", Err: fmt.Errorf("missing channel for date: %v", trade.ReferenceDate), Trade: trade}
@@ -143,7 +135,6 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 			continue
 		}
 
-		// Validate trade record and send it to the proper channel
 		if trade.IsValid() {
 			resultsChan <- trade
 		} else {
@@ -156,18 +147,14 @@ func ParseCSV(filePath string, fileID int, dateChannels map[time.Time]chan *mode
 
 // calculateHash generates an MD5 hash for a CSV record
 func calculateHash(record []string) string {
-	// Use strings.Join for efficient concatenation.
 	lineContent := strings.Join(record, ";")
 
-	// Create xxHash hash
 	digest := xxhash.New()
 	digest.Write([]byte(lineContent))
 
-	// Convert to hex string
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
-// GetFileChecksum calculates the xxHash checksum of a file.
 func GetFileChecksum(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {

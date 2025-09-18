@@ -23,7 +23,6 @@ func NewPostgresDBManager(ctx context.Context, pool *pgxpool.Pool) *PostgresDBMa
 	return &PostgresDBManager{dbpool: pool, ctx: ctx}
 }
 
-// CreateFileRecordTable creates the file_records table in the database.
 func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS file_records (
@@ -44,7 +43,6 @@ func (m *PostgresDBManager) CreateFileRecordsTable() error {
 	return nil
 }
 
-// CreateTradeRecordsTable creates the final trade_records parent partition table.
 func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS trade_records (
@@ -60,9 +58,6 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 		hash VARCHAR(32) NOT NULL
 	) PARTITION BY RANGE (reference_date); 
 	`
-	// Note: We intentionally avoid creating global unique indexes (like PRIMARY KEY)
-	// on the parent table. Uniqueness (reference_date, hash) will be enforced on in the application level.
-
 	_, err := m.dbpool.Exec(m.ctx, query)
 	if err != nil {
 		return fmt.Errorf("error creating trade_records partition table: %v", err)
@@ -71,41 +66,25 @@ func (m *PostgresDBManager) CreateTradeRecordsTable() error {
 	return nil
 }
 
-// ADD: A new function to create a uniquely named UNLOGGED staging table for a worker.
-func (m *PostgresDBManager) CreateWorkerStagingTable(tableName string) error {
-	// We use LIKE to ensure the structure always matches the target table.
-	query := fmt.Sprintf(`CREATE UNLOGGED TABLE IF NOT EXISTS %s (LIKE trade_records INCLUDING DEFAULTS);`, pgx.Identifier{tableName}.Sanitize())
-	_, err := m.dbpool.Exec(m.ctx, query)
-	if err != nil {
-		return fmt.Errorf("error creating worker staging table %s: %v", tableName, err)
-	}
-	return nil
-}
-
-// CreateWorkerStagingTables creates multiple staging tables in a single transaction.
 func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, error) {
 	if numTables <= 0 {
 		return nil, nil
 	}
 
-	// Generate all table names upfront
 	stagingTableNames := make([]string, numTables)
 	for w := 1; w <= numTables; w++ {
 		stagingTableNames[w-1] = fmt.Sprintf("trade_records_staging_worker_%d", w)
 	}
 
-	// Begin a transaction
 	tx, err := m.dbpool.Begin(m.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error beginning transaction: %v", err)
 	}
 
-	// Check which tables already exist with a single query
 	existingTables := make(map[string]bool)
 	placeholders := make([]string, len(stagingTableNames))
 	args := make([]interface{}, len(stagingTableNames))
 
-	// Create query with placeholders ($1, $2, $3, etc.)
 	for i, name := range stagingTableNames {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = name
@@ -117,7 +96,6 @@ func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, 
 
 	rows, err := tx.Query(m.ctx, checkQuery, args...)
 	if err != nil {
-		// Roll back on error
 		rx := tx.Rollback(m.ctx)
 		if rx != nil {
 			log.Printf("Error rolling back transaction: %v", rx)
@@ -125,7 +103,6 @@ func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, 
 		return nil, fmt.Errorf("error checking existing staging tables: %w", err)
 	}
 
-	// Map existing table names
 	for rows.Next() {
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
@@ -148,7 +125,6 @@ func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, 
 		return nil, fmt.Errorf("error iterating over rows: %w", err)
 	}
 
-	// Create tables that don't exist yet
 	for _, tableName := range stagingTableNames {
 		if !existingTables[tableName] {
 			query := fmt.Sprintf(`CREATE UNLOGGED TABLE IF NOT EXISTS %s (LIKE trade_records INCLUDING DEFAULTS);`,
@@ -156,10 +132,8 @@ func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, 
 
 			_, err := tx.Exec(m.ctx, query)
 			if err != nil {
-				// If there's an error, roll back the transaction
 				rx := tx.Rollback(m.ctx)
 				if rx != nil {
-					// Just log rollback errors, return the original error
 					log.Printf("Error rolling back transaction: %v", rx)
 				}
 				return nil, fmt.Errorf("error creating worker staging table %s: %v", tableName, err)
@@ -170,7 +144,6 @@ func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, 
 		}
 	}
 
-	// Commit the transaction
 	if err := tx.Commit(m.ctx); err != nil {
 		return nil, fmt.Errorf("error committing transaction: %v", err)
 	}
@@ -178,7 +151,6 @@ func (m *PostgresDBManager) CreateWorkerStagingTables(numTables int) ([]string, 
 	return stagingTableNames, nil
 }
 
-// ADD: A new function to drop the worker's staging table during cleanup.
 func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
 	query := fmt.Sprintf(`DROP TABLE IF EXISTS %s;`, pgx.Identifier{tableName}.Sanitize())
 	_, err := m.dbpool.Exec(m.ctx, query)
@@ -190,7 +162,6 @@ func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 	queries := []string{
-		`CREATE INDEX IF NOT EXISTS idx_trade_records_hash ON trade_records (reference_date, hash)`,
 		`CREATE INDEX idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`,
 	}
 
@@ -206,7 +177,6 @@ func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 
 func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 	queries := []string{
-		`DROP INDEX IF EXISTS idx_trade_records_hash`,
 		`DROP INDEX IF EXISTS idx_trade_records_ticker_txdate_covering`,
 	}
 
@@ -220,75 +190,8 @@ func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 	return nil
 }
 
-// getPartitionTableName generates a consistent partition name for a given date.
 func getPartitionTableName(date time.Time) string {
-	// Format: trade_records_YYYYMMDD
 	return fmt.Sprintf("trade_records_%s", date.Format("20060102"))
-}
-
-// CheckIfPartitionExists checks if a partition for the given date already exists.
-func (m *PostgresDBManager) CheckIfPartitionExists(date time.Time) (bool, error) {
-	tableName := getPartitionTableName(date)
-
-	query := `
-	SELECT 1
-	FROM pg_class c
-	JOIN pg_namespace n ON n.oid = c.relnamespace
-	WHERE c.relname = $1
-	AND n.nspname = 'public'; -- Assuming the table is in the public schema
-
-	`
-	var exists int
-	err := m.dbpool.QueryRow(m.ctx, query, tableName).Scan(&exists)
-
-	if err == pgx.ErrNoRows {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("error checking partition existence for %s: %w", tableName, err)
-	}
-	return true, nil
-}
-
-// CreatePartitionForDate creates a partition for a specific day if it doesn't exist.
-// This function assumes the input date is normalized (e.g., midnight UTC).
-func (m *PostgresDBManager) CreatePartitionForDate(date time.Time) error {
-	tableName := getPartitionTableName(date)
-
-	// Calculate range: [date_midnight, next_day_midnight)
-	startRange := date.Format("2006-01-02 15:04:05")
-	endRange := date.Add(24 * time.Hour).Format("2006-01-02 15:04:05")
-	createQuery := fmt.Sprintf(`
-	CREATE TABLE %s PARTITION OF trade_records
-	FOR VALUES FROM ('%s') TO ('%s');
-	`, pgx.Identifier{tableName}.Sanitize(), startRange, endRange)
-
-	log.Printf("Creating partition %s for range [%s, %s)", tableName, startRange, endRange)
-
-	_, err := m.dbpool.Exec(m.ctx, createQuery)
-	if err != nil {
-		if !m.isPartitionAlreadyExistsError(err) {
-			return fmt.Errorf("error creating partition %s: %w", tableName, err)
-		}
-		log.Printf("Partition %s already exists, skipping creation.", tableName)
-		return nil // Already exists, not an error
-	}
-
-	indexName := "idx_unique_" + tableName
-	indexQuery := fmt.Sprintf(`
-		CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (reference_date, hash);
-	`, pgx.Identifier{indexName}.Sanitize(), pgx.Identifier{tableName}.Sanitize())
-
-	log.Printf("Applying unique index %s to partition %s", indexName, tableName)
-	_, err = m.dbpool.Exec(m.ctx, indexQuery)
-	if err != nil {
-		if !m.isPartitionAlreadyExistsError(err) {
-			return fmt.Errorf("error applying unique index to partition %s: %w", tableName, err)
-		}
-		log.Printf("Unique index on partition %s already exists.", tableName)
-	}
-
-	return nil
 }
 
 func (m *PostgresDBManager) isPartitionAlreadyExistsError(err error) bool {
@@ -296,14 +199,11 @@ func (m *PostgresDBManager) isPartitionAlreadyExistsError(err error) bool {
 	return strings.Contains(errStr, "already exists") || strings.Contains(errStr, "duplicate key value violates unique constraint")
 }
 
-// CreatePartitionsForDates creates partitions for multiple dates in a single transaction
 func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstWritePartition, error) {
 	if len(dates) == 0 {
-		// Nothing to do
 		return nil, nil
 	}
 
-	// Generate all the table names first
 	tableNames := make([]string, 0, len(dates))
 	dateToTableName := make(map[time.Time]string, len(dates))
 	createdPartitions := make(FirstWritePartition)
@@ -312,22 +212,18 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 		tableName := getPartitionTableName(date)
 		tableNames = append(tableNames, tableName)
 		dateToTableName[date] = tableName
-		// populate map with all dates being processed
 		createdPartitions[date] = true
 	}
 
-	// Begin a transaction
 	tx, err := m.dbpool.Begin(m.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error beginning transaction: %v", err)
 	}
 
-	// Check which tables already exist with a single query
 	existingTables := make(map[string]bool)
 	placeholders := make([]string, len(tableNames))
 	args := make([]interface{}, len(tableNames))
 
-	// Create query with placeholders ($1, $2, $3, etc.)
 	for i, name := range tableNames {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = name
@@ -339,7 +235,6 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 
 	rows, err := tx.Query(m.ctx, checkQuery, args...)
 	if err != nil {
-		// Roll back on error
 		rx := tx.Rollback(m.ctx)
 		if rx != nil {
 			log.Printf("Error rolling back transaction: %v", rx)
@@ -347,7 +242,6 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 		return nil, fmt.Errorf("error checking existing partitions: %w", err)
 	}
 
-	// Map existing table names
 	for rows.Next() {
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
@@ -370,12 +264,10 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 		return nil, fmt.Errorf("error iterating over rows: %w", err)
 	}
 
-	// Create partitions for dates where tables don't exist
 	for _, date := range dates {
 		tableName := dateToTableName[date]
 
 		if !existingTables[tableName] {
-			// Calculate range: [date_midnight, next_day_midnight)
 			startRange := date.Format("2006-01-02 15:04:05")
 			endRange := date.Add(24 * time.Hour).Format("2006-01-02 15:04:05")
 			createQuery := fmt.Sprintf(
@@ -388,10 +280,8 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 			_, err := tx.Exec(m.ctx, createQuery)
 			if err != nil {
 				if !m.isPartitionAlreadyExistsError(err) {
-					// If there's an error, roll back the transaction
 					rx := tx.Rollback(m.ctx)
 					if rx != nil {
-						// Just log rollback errors, return the original error
 						log.Printf("Error rolling back transaction: %v", rx)
 					}
 					return nil, fmt.Errorf("error creating partition %s: %w", tableName, err)
@@ -405,7 +295,6 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 		}
 	}
 
-	// Commit the transaction
 	if err := tx.Commit(m.ctx); err != nil {
 		return nil, fmt.Errorf("error committing transaction: %v", err)
 	}
@@ -413,7 +302,6 @@ func (m *PostgresDBManager) CreatePartitionsForDates(dates []time.Time) (*FirstW
 	return &createdPartitions, nil
 }
 
-// InsertFileRecord inserts a new file record into the file_records table.
 func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, status string, checksum string, referenceDate time.Time) (int, error) {
 	query := `
 	INSERT INTO file_records (file_name, processed_at, status, checksum, reference_date)
@@ -429,22 +317,6 @@ func (m *PostgresDBManager) InsertFileRecord(fileName string, date time.Time, st
 	return fileID, nil
 }
 
-// UpdateFileChecksum updates the checksum of a file record in the database.
-func (m *PostgresDBManager) UpdateFileChecksum(fileID int, checksum string) error {
-	query := `
-	UPDATE file_records
-	SET checksum = $1
-	WHERE id = $2;`
-
-	_, err := m.dbpool.Exec(m.ctx, query, checksum, fileID)
-	if err != nil {
-		return fmt.Errorf("error updating file checksum: %v", err)
-	}
-
-	return nil
-}
-
-// UpdateFileStatus updates the status of a file record in the database.
 func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors any) error {
 	query := `
 	UPDATE file_records
@@ -460,7 +332,6 @@ func (m *PostgresDBManager) UpdateFileStatus(fileID int, status string, errors a
 	return nil
 }
 
-// IsFileAlreadyProcessed finds a file record by its checksum.
 func (m *PostgresDBManager) IsFileAlreadyProcessed(checksum string) (bool, error) {
 	query := `
 	SELECT id
@@ -473,7 +344,7 @@ func (m *PostgresDBManager) IsFileAlreadyProcessed(checksum string) (bool, error
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return false, nil // Not found, but not an error
+			return false, nil
 		}
 		return false, fmt.Errorf("error finding file record by checksum: %v", err)
 	}
@@ -487,14 +358,12 @@ func (m *PostgresDBManager) CopyTradesIntoStagingTable(tx pgx.Tx, trades []*mode
 		"hash", "reference_date", "transaction_date", "ticker", "identifier", "price", "quantity", "closing_time", "file_id",
 	}
 
-	// The copy source is an iterator that reads from our slice of trades.
 	copySource := pgx.CopyFromSlice(len(trades), func(i int) ([]interface{}, error) {
 		trade := trades[i]
 		return []interface{}{trade.Hash, trade.ReferenceDate, trade.TransactionDate, trade.Ticker, trade.Identifier, trade.Price, trade.Quantity, trade.ClosingTime, trade.FileID},
 			nil
 	})
 
-	// Perform the bulk insert.
 	_, err := tx.CopyFrom(
 		m.ctx,
 		pgx.Identifier{stagingTableName},
@@ -505,22 +374,19 @@ func (m *PostgresDBManager) CopyTradesIntoStagingTable(tx pgx.Tx, trades []*mode
 	return err
 }
 
-// InsertAllStagingTableData inserts all data from a staging table into trade_records without checking for duplicates.
 func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, stagingTableName string) error {
 	tx, err := m.dbpool.Begin(m.ctx)
 	if err != nil {
 		return fmt.Errorf("error beginning transaction: %v", err)
 	}
-	defer tx.Rollback(m.ctx) // Rollback is a no-op if the transaction is already committed.
+	defer tx.Rollback(m.ctx)
 
-	// Step 1: Bulk load into the worker's assigned staging table.
 	log.Printf("Bulk loading %d trades into staging table %s", len(trades), stagingTableName)
 	err = m.CopyTradesIntoStagingTable(tx, trades, stagingTableName)
 	if err != nil {
 		return fmt.Errorf("unable to copy trades to staging table %s: %v", stagingTableName, err)
 	}
 
-	// Step 2: Insert all data from the staging table to the main table
 	insertQuery := fmt.Sprintf(`
 	INSERT INTO trade_records (hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id)
 	SELECT hash, reference_date, transaction_date, ticker, identifier, price, quantity, closing_time, file_id
@@ -533,12 +399,10 @@ func (m *PostgresDBManager) InsertAllStagingTableData(trades []*models.Trade, st
 		return fmt.Errorf("error inserting all data from staging table %s: %v", stagingTableName, err)
 	}
 
-	// Step 3: Truncate the worker's staging table to prepare for its *next* batch.
 	truncateQuery := fmt.Sprintf(`TRUNCATE %s;`, pgx.Identifier{stagingTableName}.Sanitize())
 	log.Printf("Truncating staging table %s.", stagingTableName)
 	_, err = tx.Exec(m.ctx, truncateQuery)
 	if err != nil {
-		// This is not a fatal error for the data itself, but should be logged as a warning.
 		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
 	}
 
@@ -580,12 +444,10 @@ func (m *PostgresDBManager) InsertDiffFromStagingTable(trades []*models.Trade, s
 		return fmt.Errorf("error inserting differences from staging table %s: %v", stagingTableName, err)
 	}
 
-	// Step 3: Truncate the worker's staging table to prepare for its *next* batch.
 	truncateQuery := fmt.Sprintf(`TRUNCATE %s;`, pgx.Identifier{stagingTableName}.Sanitize())
 	log.Printf("Truncating staging table %s.", stagingTableName)
 	_, err = tx.Exec(m.ctx, truncateQuery)
 	if err != nil {
-		// This is not a fatal error for the data itself, but should be logged as a warning.
 		log.Printf("WARN: failed to truncate staging table %s: %v", stagingTableName, err)
 	}
 
