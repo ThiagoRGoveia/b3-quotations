@@ -36,9 +36,13 @@ func (h *IngestionService) Execute(filesPath string) error {
 	}
 
 	// Step 0.1: Drop indexes before starting for efficiency
+	log.Println("Dropping trade record indexes...")
 	h.dbManager.DropTradeRecordIndexes()
 	// Step 0.2: Make sure indexes are created after the process
-	defer h.dbManager.CreateTradeRecordIndexes()
+	defer func() {
+		log.Println("Re-creating trade record indexes...")
+		h.dbManager.CreateTradeRecordIndexes()
+	}()
 
 	fileInfo, channels, waitGroups, fileMap, fileErrorsMap, createdPartitions, cleanup := setupReturn.GetValues()
 	defer cleanup()
@@ -110,12 +114,12 @@ func (h *IngestionService) Execute(filesPath string) error {
 	log.Println("Waiting for DB workers to finish...")
 	dbWorkerWaitGroup.Wait()
 
-	// Step 6.3: Wait for file error worker to finish
+	// Step 6.3: Close the errors channel after all workers that can produce errors are done.
+	close(channels.Errors)
+
+	// Step 6.4: Wait for file error worker to finish
 	log.Println("Waiting for file error worker to finish...")
 	errorWorkerWaitGroup.Wait()
-
-	// Step 6.4: Close the errors channel after all workers that can produce errors are done.
-	close(channels.Errors)
 
 	// Step 7: Update each file record with status of operation and errors with results from o
 	h.fileProcessor.UpdateFileStatus(fileErrorsMap, fileMap)
