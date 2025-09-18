@@ -171,7 +171,7 @@ func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 	queries := []string{
-		`CREATE INDEX idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`,
+		`CREATE INDEX IF NOT EXISTS idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`,
 	}
 
 	for _, query := range queries {
