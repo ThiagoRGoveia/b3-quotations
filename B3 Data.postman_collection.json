@@ -1,0 +1,42 @@
+{
+	"info": {
+		"_postman_id": "d0d3273c-cd9d-4b7d-a340-e652ff70e057",
+		"name": "B3 Data",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "10932304"
+	},
+	"item": [
+		{
+			"name": "get_transaction_volume",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/tickers/:ticker?data_inicio=2025-09-05",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"tickers",
+						":ticker"
+					],
+					"query": [
+						{
+							"key": "data_inicio",
+							"value": "2025-09-05"
+						}
+					],
+					"variable": [
+						{
+							"key": "ticker",
+							"value": "ETRU25"
+						}
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}
