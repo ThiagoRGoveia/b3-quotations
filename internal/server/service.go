@@ -51,9 +51,14 @@ func (h *TickerService) GetTickerInfo(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// timeNow is a variable to facilitate testing by allowing time.Now to be mocked
+// this is enough for this simple use case, for more robustness, DI would be ideal like
+// the other services
+var timeNow = time.Now
+
 // getPastBusinessDay calculates the date n business days in the past.
 func getPastBusinessDay(days int) time.Time {
-	date := time.Now()
+	date := timeNow()
 	for businessDays := 0; businessDays < days; {
 		date = date.AddDate(0, 0, -1)
 		if date.Weekday() != time.Saturday && date.Weekday() != time.Sunday {

@@ -145,24 +145,45 @@ func TestTickerService_GetTickerInfo(t *testing.T) {
 }
 
 func Test_getPastBusinessDay(t *testing.T) {
-	t.Run("should return the correct past business day", func(t *testing.T) {
-		now := time.Date(2023, 10, 11, 0, 0, 0, 0, time.UTC)
-		getPastBusinessDay := func(days int) time.Time {
-			date := now
-			for businessDays := 0; businessDays < days; {
-				date = date.AddDate(0, 0, -1)
-				if date.Weekday() != time.Saturday && date.Weekday() != time.Sunday {
-					businessDays++
-				}
-			}
-			return date
-		}
+	// Here we are mocking the time.Now function
+	originalTimeNow := timeNow
+	defer func() { timeNow = originalTimeNow }()
 
+	t.Run("should return the correct past business day", func(t *testing.T) {
+		// Mock the time.Now function to return a fixed date
+		fixedDate := time.Date(2023, 10, 11, 0, 0, 0, 0, time.UTC) // Wednesday
+		timeNow = func() time.Time { return fixedDate }
+
+		// Calculate the expected date (7 business days before Oct 11, 2023)
+		// Oct 11 is a Wednesday, going back 7 business days:
+		// Oct 10 (Tue), Oct 9 (Mon), Oct 6 (Fri), Oct 5 (Thu), Oct 4 (Wed), Oct 3 (Tue), Oct 2 (Mon)
 		expected := time.Date(2023, 10, 2, 0, 0, 0, 0, time.UTC)
+
 		actual := getPastBusinessDay(7)
 
-		assert.Equal(t, expected.Year(), actual.Year())
-		assert.Equal(t, expected.Month(), actual.Month())
-		assert.Equal(t, expected.Day(), actual.Day())
+		assert.Equal(t, expected, actual, "The dates should match exactly")
+	})
+
+	t.Run("should handle weekends correctly", func(t *testing.T) {
+		// Mock the time.Now function to return a Monday
+		fixedDate := time.Date(2023, 10, 9, 0, 0, 0, 0, time.UTC) // Monday
+		timeNow = func() time.Time { return fixedDate }
+
+		// Going back 3 business days from Monday Oct 9:
+		// Oct 6 (Fri), Oct 5 (Thu), Oct 4 (Wed)
+		expected := time.Date(2023, 10, 4, 0, 0, 0, 0, time.UTC)
+
+		actual := getPastBusinessDay(3)
+
+		assert.Equal(t, expected, actual)
+	})
+
+	t.Run("should return the same day for 0 days", func(t *testing.T) {
+		fixedDate := time.Date(2023, 10, 11, 0, 0, 0, 0, time.UTC)
+		timeNow = func() time.Time { return fixedDate }
+
+		actual := getPastBusinessDay(0)
+
+		assert.Equal(t, fixedDate, actual, "Should return the current date for 0 days")
 	})
 }
