@@ -33,7 +33,7 @@ type CSVRow struct {
 func newDefaultCSVRow() CSVRow {
 	return CSVRow{
 		DataReferencia:              "2025-09-08",
-		CodigoInstrumento:           "ETRU25",
+		CodigoInstrumento:           "ABS123",
 		AcaoAtualizacao:             "0",
 		PrecoNegocio:                "4310,000",
 		QuantidadeNegociada:         "1",
