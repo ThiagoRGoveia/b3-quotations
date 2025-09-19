@@ -146,7 +146,6 @@ func (w *AsyncWorker) ErrorWorker(fileErrorsMap *models.FileErrorMap) {
 	defer w.waitGroups.MainWg.Done()
 	for appErr := range w.channels.Errors {
 		log.Printf("Caught error: %s\n", appErr.Error())
-		log.Println(len(fileErrorsMap.Errors))
 		// limit the number of errors per file to prevent memory overflow, if more than 100 errors are collected, then file is probably malformed
 		if appErr.FileID != -1 && len(fileErrorsMap.Errors[appErr.FileID]) < 100 {
 			fileErrorsMap.Mu.Lock()
