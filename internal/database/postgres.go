@@ -171,7 +171,7 @@ func (m *PostgresDBManager) DropWorkerStagingTable(tableName string) error {
 
 func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 	queries := []string{
-		`CREATE INDEX IF NOT EXISTS idx_trade_records_covering ON trade_records (ticker, transaction_date, price, quantity);`,
+		`CREATE INDEX IF NOT EXISTS idx_trade_records_optimized ON trade_records (ticker, transaction_date) INCLUDE (price, quantity, reference_date);`,
 	}
 
 	for _, query := range queries {
@@ -186,7 +186,7 @@ func (m *PostgresDBManager) CreateTradeRecordIndexes() error {
 
 func (m *PostgresDBManager) DropTradeRecordIndexes() error {
 	queries := []string{
-		`DROP INDEX IF EXISTS idx_trade_records_ticker_txdate_covering`,
+		`DROP INDEX IF EXISTS idx_trade_records_optimized`,
 	}
 
 	for _, query := range queries {
@@ -475,7 +475,7 @@ func (m *PostgresDBManager) GetTickerInfo(ticker string, startDate time.Time) (*
     FROM
         trade_records
     WHERE
-        ticker = $1 AND transaction_date >= $2 AND reference_date >= $2
+        ticker = $1 AND reference_date >= $2 AND transaction_date >= $2
 		),
 		daily_volumes AS (
 				SELECT
