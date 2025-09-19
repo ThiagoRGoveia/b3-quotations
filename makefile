@@ -1,4 +1,4 @@
-.PHONY: start stop setup ingest clean-db
+.PHONY: start stop setup ingest clean-db test
 
 # Default path for data ingestion if not provided
 FILES_PATH ?= files
@@ -28,3 +28,8 @@ clean-db:
 	@echo "Stopping services and removing docker volume..."
 	@docker compose down --volumes
 	@echo "Docker volume removed."
+
+test:
+	@echo "Running tests..."
+	@docker compose run --rm test
+	@echo "Tests finished."
