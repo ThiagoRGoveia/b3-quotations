@@ -44,7 +44,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./files:/app/files
+      - .:/app/project
 
   api:
     <<: *app-base

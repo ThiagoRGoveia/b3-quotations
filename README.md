@@ -275,6 +275,16 @@ Antes de começar, certifique-se de que você tem o seguinte instalado:
 
 Siga estes passos para colocar a aplicação em funcionamento:
 
+### TLRD
+
+```bash
+make setup // Cria o banco de dados e as tabelas
+make start // Inicia os serviços DB & API
+make ingest // Inicia o serviço de ingestão de dados lendo o diretório `files/`
+make test // Executa os testes
+make clean-db // Remove dados do banco de dados
+```
+
 
 ### 1. Set up Environment Variables
 

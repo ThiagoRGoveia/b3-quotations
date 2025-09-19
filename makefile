@@ -21,7 +21,7 @@ setup: start
 
 ingest:
 	@echo "Starting data ingestion from $(FILES_PATH)..."
-	@docker compose run --rm data_ingestion ./data_ingestion $(FILES_PATH)
+	@docker compose run --rm data_ingestion ./data_ingestion project/$(FILES_PATH)
 	@echo "Data ingestion finished."
 
 clean-db:
