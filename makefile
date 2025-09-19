@@ -19,7 +19,7 @@ setup: start
 	@docker compose run --rm setup
 	@echo "Database setup finished."
 
-ingest: start
+ingest:
 	@echo "Starting data ingestion from $(FILES_PATH)..."
 	@docker compose run --rm data_ingestion ./data_ingestion $(FILES_PATH)
 	@echo "Data ingestion finished."
