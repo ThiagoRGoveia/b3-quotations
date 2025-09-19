@@ -12,10 +12,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-func setup(dbManager database.DBManager) error {
-	return dbManager.CreateTradeRecordIndexes()
-}
-
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -39,7 +35,6 @@ func main() {
 	}
 	defer dbpool.Close()
 
-	err = setup(dbManager)
 	if err != nil {
 		log.Fatalf("Failed to setup database: %v", err)
 	}
