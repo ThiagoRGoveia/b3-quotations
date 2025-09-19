@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/mock"
 )
 
-// MockDBManager is a mock implementation of the DBManager interface.
 type MockDBManager struct {
 	mock.Mock
 }
@@ -147,9 +146,7 @@ func TestTickerService_GetTickerInfo(t *testing.T) {
 
 func Test_getPastBusinessDay(t *testing.T) {
 	t.Run("should return the correct past business day", func(t *testing.T) {
-		// Assuming today is a Wednesday
-		// 7 business days in the past should be the Tuesday of the previous week
-		now := time.Date(2023, 10, 11, 0, 0, 0, 0, time.UTC) // A Wednesday
+		now := time.Date(2023, 10, 11, 0, 0, 0, 0, time.UTC)
 		getPastBusinessDay := func(days int) time.Time {
 			date := now
 			for businessDays := 0; businessDays < days; {
@@ -161,11 +158,9 @@ func Test_getPastBusinessDay(t *testing.T) {
 			return date
 		}
 
-		expected := time.Date(2023, 10, 2, 0, 0, 0, 0, time.UTC) // A Monday
+		expected := time.Date(2023, 10, 2, 0, 0, 0, 0, time.UTC)
 		actual := getPastBusinessDay(7)
 
-		// Since we are testing a function that depends on time.Now(), we need to control the 'now'
-		// For this test, we'll check if the resulting day is the expected one, ignoring the time part.
 		assert.Equal(t, expected.Year(), actual.Year())
 		assert.Equal(t, expected.Month(), actual.Month())
 		assert.Equal(t, expected.Day(), actual.Day())
