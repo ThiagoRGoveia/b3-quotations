@@ -206,7 +206,7 @@ A aplicação foi projetada com foco em alto desempenho:
 ### Diagrama de Arquitetura
 
 
-![Diagrama de Arquitetura](/architectrure_dark.png)
+![Diagrama de Arquitetura](/architectrure_light.png)
 
 
 ### Tratamento de Erros
